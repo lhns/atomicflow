@@ -214,6 +214,53 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 44)
   }
 
+  test("Workflow with a failed once step should fail") {
+    val answer = AtomicInteger(42)
+
+    val workflow = Workflow[String, Int](
+      WorkflowId("5b1d59cf-4794-4c92-ab4d-586fc4e30a5d"),
+      name = "workflow with once steps, exception"
+    ) { (string: String) =>
+      Step(StepId("8468fc4a-c510-49b4-bebd-013de0e273ff"), 0) {
+        Step.onlyOnce(
+          "input" -> string
+        )
+
+        val a = answer.get()
+        if (a == 42)
+          a
+        else
+          throw new RuntimeException("error")
+      }
+    }
+
+    val workflowInstanceId = WorkflowInstanceId.generate
+
+    //assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+
+    answer.set(43)
+
+    intercept[RuntimeException] {
+      workflow.instance(workflowInstanceId).run("answer")
+    }
+
+    answer.set(42)
+
+    intercept[StepUnknownStateException] {
+      workflow.instance(workflowInstanceId).run("answer")
+    }
+
+    assertEquals(
+      workflow.instance(workflowInstanceId)
+        .overrideStepIdempotencyId(
+          StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"),
+          StepIdempotencyId.generate
+        )
+        .run("answer"),
+      42
+    )
+  }
+
   test("Signals can be set but not to a different value") {
     val signal = Signal[String](SignalId("fbf1760e-c3d4-4635-a84b-8426f2d521ef"))
 
