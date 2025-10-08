@@ -1,6 +1,8 @@
+import scala.collection.Seq
+
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-ThisBuild / scalaVersion := "3.6.4"
+ThisBuild / scalaVersion := "3.7.3"
 
 val V = new {
   val cats = "2.13.0"
@@ -12,6 +14,7 @@ val V = new {
   val neotype = "0.3.25"
   val ox = "0.7.0"
   val upickle = "4.2.1"
+  val testcontainers = "1.21.3"
 }
 
 lazy val root = (project in file("."))
@@ -48,5 +51,37 @@ lazy val db = project
       "org.tpolecat" %% "doobie-postgres" % V.doobie,
       "org.tpolecat" %% "doobie-postgres-circe" % V.doobie,
       "org.tpolecat" %% "doobie-hikari" % V.doobie,
+      "org.testcontainers" % "testcontainers" % V.testcontainers % Test,
+      "org.testcontainers" % "postgresql" % V.testcontainers % Test
     )
+  )
+
+lazy val example = project
+  .dependsOn(core, db)
+  .settings(
+    name := "atomicflow-examples",
+    libraryDependencies ++= Seq(
+      "org.business4s" %% "workflows4s-core" % "0.4.0",
+      "org.business4s" %% "workflows4s-bpmn" % "0.4.0",
+      "org.typelevel" %% "cats-effect" % "3.6.1",
+      "org.typelevel" %% "cats-core" % "2.13.0",
+      "org.typelevel" %% "cats-mtl" % "1.5.0",
+      "org.typelevel" %% "kittens" % "3.5.0",
+      "org.http4s" %% "http4s-jdk-http-client" % "0.10.0",
+      "org.http4s" %% "http4s-dsl" % "0.23.30",
+      "co.fs2" %% "fs2-core" % "3.12.0",
+      "co.fs2" %% "fs2-io" % "3.12.0",
+      "co.fs2" %% "fs2-reactive-streams" % "3.12.0",
+      "io.circe" %% "circe-core" % V.circe,
+      "io.circe" %% "circe-parser" % V.circe,
+      "io.circe" %% "circe-generic" % V.circe,
+    ),
+    // Test dependencies
+    libraryDependencies ++= Seq(
+      "org.scalameta" %% "munit" % V.munit,
+      "org.testcontainers" % "testcontainers" % "1.21.3",
+      "org.testcontainers" % "postgresql" % "1.21.3",
+      "org.scalamock" %% "scalamock" % "7.5.0",
+      "org.scalamock" %% "scalamock-cats-effect" % "7.5.0"
+    ).map(_ % Test)
   )

@@ -5,39 +5,22 @@ import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Objects
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.FiniteDuration
 
-trait SimpleWorkflowContext {
-  def meta: WorkflowMeta
-
-  def instanceId: WorkflowInstanceId
-
-  override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceId"
-}
-
-object SimpleWorkflowContext {
-  def apply(
-             workflowMeta: WorkflowMeta,
-             workflowInstanceId: WorkflowInstanceId
-           ): SimpleWorkflowContext = new SimpleWorkflowContext {
-    override def meta: WorkflowMeta = workflowMeta
-
-    override def instanceId: WorkflowInstanceId = workflowInstanceId
-  }
-
-  given (stepCtx: StepContext[?]) => SimpleWorkflowContext = stepCtx.workflowCtx
-}
 
 @implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`\nYou can require a WorkflowContext for the enclosing method by adding a using clause `(using WorkflowContext)` to its definition.")
-trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
-  protected[atomicflow] def getFingerprinter: Fingerprinter
-
-  protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
-
-  protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
-  
-  protected[atomicflow] def getSignalStore: SignalStore
-  
-  protected[atomicflow] def defaultCacheTtl: FiniteDuration
+case class WorkflowContext(
+  workflowInstanceMeta: WorkflowInstanceMeta,
+  workflowRuntime: WorkflowRuntime,
+  defaultCacheTtl: Option[FiniteDuration] = None,
+  subworkflowScope: Vector[String] = Vector.empty
+) {
+  def withSubworkflowScope(scopeKey: String): WorkflowContext =
+    this.copy(subworkflowScope = this.subworkflowScope.appended(scopeKey))
+}
+object WorkflowContext {
+  // TODO: Muss man manchmal explizit importieren... sehr nervig.
+  given (ctx: WorkflowContext) => WorkflowInstanceMeta = ctx.workflowInstanceMeta
 }

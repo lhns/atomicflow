@@ -1,21 +1,24 @@
 package atomicflow
 
+import atomicflow.WorkflowContext.given_WorkflowInstanceMeta
+
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
+// TODO multi-event signals
 trait Signal[A] {
   def meta: SignalMeta
 
-  def cacheable: Cacheable[A]
+  def asCacheable: Cacheable[A]
 
-  def option(using WorkflowContext[?, ?]): Option[A]
+  def option(using WorkflowContext): Option[A]
 
-  def isDefined(using WorkflowContext[?, ?]): Boolean = option.isDefined
+  def isDefined(using WorkflowContext): Boolean = option.isDefined
 
-  def isEmpty(using WorkflowContext[?, ?]): Boolean = option.isEmpty
+  def isEmpty(using WorkflowContext): Boolean = option.isEmpty
 
   @throws[SignalEmptyException]
-  def value(using WorkflowContext[?, ?]): A =
+  def valueOrThrow(using WorkflowContext): A =
     option.getOrElse(throw new SignalEmptyException(this))
 
   /*@throws[SignalConflictException]
@@ -43,10 +46,10 @@ object Signal {
         }
       )
 
-      override def cacheable: Cacheable[A] = A
+      override def asCacheable: Cacheable[A] = A
 
-      override def option(using workflowCtx: WorkflowContext[?, ?]): Option[A] =
-        workflowCtx.getSignalStore.getSignalValue(this)
+      override def option(using workflowCtx: WorkflowContext): Option[A] =
+        workflowCtx.workflowRuntime.getSignalStore.getSignalValue(this)
 
       /*override def set(value: A)(using workflowCtx: WorkflowContext[?, ?]): Unit =
         workflowCtx.getSignalStore.setSignalValue(this, value)*/
