@@ -117,6 +117,9 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 
       override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
         workflowInstance.defaultCacheTtl
+
+      override protected[atomicflow] def auditLogger: AuditLogger =
+        workflowInstance.auditLogger
     }
 
     try {

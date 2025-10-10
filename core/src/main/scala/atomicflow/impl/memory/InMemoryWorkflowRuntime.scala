@@ -168,6 +168,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
                 workflowInstance.defaultCacheTtl
+
+              override protected[atomicflow] def auditLogger: AuditLogger =
+                workflowInstance.auditLogger
             }
             state.workflowInstance.workflow.body(ctx, state.in)
           } finally {
