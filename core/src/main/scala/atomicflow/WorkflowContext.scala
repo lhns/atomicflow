@@ -40,4 +40,6 @@ trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
   protected[atomicflow] def getSignalStore: SignalStore
   
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
+
+  protected[atomicflow] def auditLogger: AuditLogger
 }

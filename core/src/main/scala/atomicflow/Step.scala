@@ -1,9 +1,14 @@
 package atomicflow
 
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
+import StepAuditEvent.{StepCompleted, StepFailed, StepStarted}
+import StepAuditOutcome.{Computed, ShortCircuited}
 
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.FiniteDuration
+import scala.util.control.NonFatal
 
 object Step {
   def apply[Out](
@@ -30,6 +35,13 @@ object Step {
     )
 
     val stepWorkflowCtx = workflowCtx
+
+    val auditLogger = stepWorkflowCtx.auditLogger
+    val startedAtNanos = System.nanoTime()
+    val startedAtInstant = Instant.now()
+    auditLogger.log(StepStarted(stepMeta, startedAtInstant))
+
+    var outcome: StepAuditOutcome = Computed
 
     val completeAtomic: AtomicReference[Out => Unit] = AtomicReference[Out => Unit](_ => ())
 
@@ -63,8 +75,16 @@ object Step {
       body
     } catch {
       case brk: StepBreak[Out] @unchecked if stepCtx.eq(brk.ctx) =>
+        outcome = ShortCircuited
         brk.value
+      case NonFatal(t) =>
+        val duration = FiniteDuration(System.nanoTime() - startedAtNanos, TimeUnit.NANOSECONDS)
+        auditLogger.log(StepFailed(stepMeta, Instant.now(), duration, t))
+        throw t
     }
+
+    val duration = FiniteDuration(System.nanoTime() - startedAtNanos, TimeUnit.NANOSECONDS)
+    auditLogger.log(StepCompleted(stepMeta, Instant.now(), duration, outcome))
 
     completeAtomic.get()(result)
 

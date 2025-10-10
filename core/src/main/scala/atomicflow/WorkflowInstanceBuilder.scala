@@ -10,7 +10,8 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
                                                                             instanceId: WorkflowInstanceId,
                                                                             defaultCacheTtl: FiniteDuration = defaultCacheTtl,
                                                                             defaultSignalTtl: FiniteDuration = defaultSignalTtl,
-                                                                            stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+                                                                            stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty,
+                                                                            auditLogger: AuditLogger = AuditLogger.console
                                                                           ) {
   private[atomicflow] def simpleWorkflowCtx: SimpleWorkflowContext = SimpleWorkflowContext(
     workflow.meta,
@@ -25,6 +26,9 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
 
   def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): WorkflowInstanceBuilder[In, Out] =
     copy(stepIdempotencyIdOverrides = stepIdempotencyIdOverrides + (stepId -> stepIdempotencyId))
+
+  def withAuditLogger(logger: AuditLogger): WorkflowInstanceBuilder[In, Out] =
+    copy(auditLogger = logger)
 
   @throws[WorkflowInputConflictException]
   def create(in: In)(using runtime: WorkflowRuntime): Unit =
