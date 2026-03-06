@@ -4,6 +4,10 @@
 
 Note: `db/test` requires `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`; when they are not set, the DB suite is skipped.
 
+## 🧭 **Architecture Decisions**
+
+Architecture decisions are tracked in [adr/README.md](adr/README.md).
+
 ---
 
 ## 🚀 **Features**
