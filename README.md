@@ -2,6 +2,8 @@
 
 **AtomicFlow** is a workflow framework designed to help you manage and execute workflows in an atomic, idempotent, and repeatable manner. With the ability to handle side effects, deduplication, and easy retries, this framework ensures that business processes are executed reliably while maintaining consistency.
 
+Note: `db/test` requires `DB_URL`, `DB_USERNAME`, and `DB_PASSWORD`; when they are not set, the DB suite is skipped.
+
 ---
 
 ## 🚀 **Features**
@@ -40,6 +42,30 @@ The framework also supports **retrying workflows** when exceptions occur, ensuri
    ```
 
 2. Alternatively, download and include the jar in your project.
+
+---
+
+## ✅ **Running Tests**
+
+- Run all core tests:
+
+  ```bash
+  sbt core/test
+  ```
+
+- Run DB tests:
+
+  ```bash
+  sbt db/test
+  ```
+
+DB tests require the following environment variables:
+
+- `DB_URL`
+- `DB_USERNAME`
+- `DB_PASSWORD`
+
+If one or more variables are missing, the DB suite is ignored (skipped) instead of failing at initialization.
 
 ---
 

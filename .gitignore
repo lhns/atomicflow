@@ -1,6 +1,14 @@
 ### General ###
 *.log
 
+# Local tooling metadata
+.bloop/
+.metals/
+.vscode/
+project/.bloop/
+project/metals.sbt
+project/project/metals.sbt
+
 
 ### JVM ###
 *.class
