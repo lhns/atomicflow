@@ -1,6 +1,6 @@
 package atomicflow
 
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope}
 
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration.FiniteDuration
@@ -30,11 +30,12 @@ object Step {
     )
 
     val stepWorkflowCtx = workflowCtx
+    val currentStepScope = StepScope(stepMeta, workflowCtx.workflowScope)
 
     val completeAtomic: AtomicReference[Out => Unit] = AtomicReference[Out => Unit](_ => ())
 
     given stepCtx: StepContext[Out] = new StepContext[Out] {
-      override def meta: StepMeta = stepMeta
+      override def stepScope: StepScope = currentStepScope
 
       override def workflowCtx: WorkflowContext[?, ?] = stepWorkflowCtx
 
@@ -45,9 +46,9 @@ object Step {
         }.toMap)
       }
 
-      override lazy val idempotencyStore: StepIdempotencyStore = stepWorkflowCtx.getStepIdempotencyStore
+      override lazy val idempotencyStore: StepIdempotencyStore.Bound = stepWorkflowCtx.getStepIdempotencyStore(currentStepScope)
 
-      override def cache(using Cacheable[Out]): StepCache[Out] = stepWorkflowCtx.getStepCache
+      override def cache(using Cacheable[Out]): StepCache.Bound[Out] = stepWorkflowCtx.getStepCache(currentStepScope)
 
       override def onComplete(f: Out => Unit): Unit =
         completeAtomic.updateAndGet(prev => out => {

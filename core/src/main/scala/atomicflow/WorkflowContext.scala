@@ -1,7 +1,7 @@
 package atomicflow
 
 import atomicflow.Fingerprintable.Fingerprinter
-import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepScope, WorkflowScope}
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -33,11 +33,14 @@ object SimpleWorkflowContext {
 trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
   protected[atomicflow] def getFingerprinter: Fingerprinter
 
-  protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
+  protected[atomicflow] final def workflowScope: WorkflowScope =
+    WorkflowScope(meta, instanceId)
 
-  protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
+  protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore.Bound
+
+  protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache.Bound[StepOut]
   
-  protected[atomicflow] def getSignalStore: SignalStore
+  protected[atomicflow] def getSignalStore: SignalStore.Bound
   
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
 }

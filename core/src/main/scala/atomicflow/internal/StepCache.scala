@@ -1,7 +1,7 @@
 package atomicflow.internal
 
 import atomicflow.internal.StepInputFingerprints
-import atomicflow.{StepIdempotencyId, StepInputConflictException}
+import atomicflow.{Cacheable, StepIdempotencyId, StepInputConflictException}
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -65,26 +65,32 @@ trait StepCache {
   }
 }
 */
-trait StepCache[Out] {
-  /**
-   * the output value should be retrieved by the stepIdempotencyId. The stepVersion and stepInputs should be compared on
-   * retrieval and should throw a StepInputConflictException if they don't match
-   */
-  @throws[StepInputConflictException]
-  def get(
-           stepIdempotencyId: StepIdempotencyId,
-           inputFingerprints: StepInputFingerprints
-         ): Option[Out]
+trait StepCache {
+  def bind[Out: Cacheable](stepScope: StepScope): StepCache.Bound[Out]
+}
 
-  /**
-   * the output value should be cached by the stepIdempotencyId. The stepVersion and stepInputs should be compared on put
-   * and should throw a StepInputConflictException if they don't match
-   */
-  @throws[StepInputConflictException]
-  def put(
-           stepIdempotencyId: StepIdempotencyId,
-           inputFingerprints: StepInputFingerprints,
-           value: Out,
-           ttl: FiniteDuration
-         ): Unit
+object StepCache {
+  trait Bound[Out] {
+    /**
+     * the output value should be retrieved by the stepIdempotencyId. The stepVersion and stepInputs should be compared on
+     * retrieval and should throw a StepInputConflictException if they don't match
+     */
+    @throws[StepInputConflictException]
+    def get(
+             stepIdempotencyId: StepIdempotencyId,
+             inputFingerprints: StepInputFingerprints
+           ): Option[Out]
+
+    /**
+     * the output value should be cached by the stepIdempotencyId. The stepVersion and stepInputs should be compared on put
+     * and should throw a StepInputConflictException if they don't match
+     */
+    @throws[StepInputConflictException]
+    def put(
+             stepIdempotencyId: StepIdempotencyId,
+             inputFingerprints: StepInputFingerprints,
+             value: Out,
+             ttl: FiniteDuration
+           ): Unit
+  }
 }

@@ -3,7 +3,7 @@ package atomicflow.impl.memory
 import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, SignalStore}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, WorkflowScope}
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
@@ -18,13 +18,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
     val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
-    def getIdempotencyStore(
-                             stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
-                           )(
-                             using stepCtx: StepContext[?]
-                           ): StepIdempotencyStore = new StepIdempotencyStore {
+    def bind(
+              stepScope: StepScope,
+              stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+            ): StepIdempotencyStore.Bound = new StepIdempotencyStore.Bound {
       override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
-        val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, inputFingerprints)
+        val key = StepIdempotencyIdKey(stepScope.stepMeta.id, stepScope.stepMeta.version, inputFingerprints)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
           case Some(_) => ids
           case None =>
@@ -34,8 +33,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
       }
 
       override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
-        val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
-        stepIdempotencyIdOverrides.get(stepCtx.meta.id) match {
+        val key = OnceStepIdempotencyIdKey(stepScope.stepMeta.id)
+        stepIdempotencyIdOverrides.get(stepScope.stepMeta.id) match {
           case Some(idempotencyId) =>
             idempotencyIds.updateAndGet(_ + (key -> idempotencyId))
             idempotencyId
@@ -52,17 +51,18 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   }
 
   class WorkflowStepCache {
-    val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
+    val stepCache: AtomicReference[Map[StepIdempotencyId, (StepId, Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
 
-    def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
+    def bind[StepOut](stepScope: StepScope): StepCache.Bound[StepOut] = new StepCache.Bound[StepOut] {
       override def get(
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints
                       ): Option[StepOut] = {
-        val stepVersion = ctx.meta.version
+        val stepId = stepScope.stepMeta.id
+        val stepVersion = stepScope.stepMeta.version
         stepCache.get().get(stepIdempotencyId).map {
-          case (`stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
-          case _ => throw new StepInputConflictException()
+          case (`stepId`, `stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
+          case _ => throw stepScope.stepInputConflictException()
         }
       }
 
@@ -73,8 +73,19 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                         value: StepOut,
                         ttl: FiniteDuration
                       ): Unit = {
-        // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
-        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, inputFingerprints, value)))
+        val stepId = stepScope.stepMeta.id
+        val stepVersion = stepScope.stepMeta.version
+
+        stepCache.updateAndGet { cache =>
+          cache.get(stepIdempotencyId) match {
+            case Some((existingStepId, existingStepVersion, existingFingerprints, _))
+              if existingStepId != stepId || existingStepVersion != stepVersion || existingFingerprints != inputFingerprints =>
+              throw stepScope.stepInputConflictException()
+
+            case _ =>
+              cache + (stepIdempotencyId -> (stepId, stepVersion, inputFingerprints, value))
+          }
+        }
       }
     }
   }
@@ -157,14 +168,14 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
-              override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
-                state.stepIdempotencyStore.getIdempotencyStore(workflowInstance.stepIdempotencyIdOverrides)
+              override protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore.Bound =
+                state.stepIdempotencyStore.bind(stepScope, workflowInstance.stepIdempotencyIdOverrides)
 
-              override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
-                state.stepCache.getStepCache[StepOut]
+              override protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache.Bound[StepOut] =
+                state.stepCache.bind[StepOut](stepScope)
 
-              override protected[atomicflow] def getSignalStore: SignalStore =
-                signalStore
+              override protected[atomicflow] def getSignalStore: SignalStore.Bound =
+                signalStore.bind(workflowScope)
 
               override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
                 workflowInstance.defaultCacheTtl
@@ -183,22 +194,25 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   private val signalStore: SignalStore = new SignalStore {
     val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceId, SignalId), ?]] = new AtomicReference(Map.empty)
 
-    override def getSignalValue[A](signal: Signal[A])(using ctx: SimpleWorkflowContext): Option[A] = {
-      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
-      signalValues.get().get(key).asInstanceOf[Option[A]]
-    }
+    override def bind(workflowScope: WorkflowScope): SignalStore.Bound = new SignalStore.Bound {
+      override def getSignalValue[A](signal: Signal[A]): Option[A] = {
+        val key = (workflowScope.workflowMeta.id, workflowScope.workflowInstanceId, signal.meta.id)
+        signalValues.get().get(key).asInstanceOf[Option[A]]
+      }
 
-    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: SimpleWorkflowContext): Unit = {
-      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+      override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
+        val key = (workflowScope.workflowMeta.id, workflowScope.workflowInstanceId, signal.meta.id)
+        given SimpleWorkflowContext = workflowScope.simpleWorkflowContext
 
-      if (!workflowInstances.get().contains(ctx.instanceId))
-        throw new WorkflowNotFoundException()
+        if (!workflowInstances.get().contains(workflowScope.workflowInstanceId))
+          throw new WorkflowNotFoundException()
 
-      signalValues.updateAndGet { map =>
-        if (map.get(key).exists(_ != value))
-          throw new SignalConflictException(signal)
+        signalValues.updateAndGet { map =>
+          if (map.get(key).exists(_ != value))
+            throw new SignalConflictException(signal)
 
-        map + (key -> value)
+          map + (key -> value)
+        }
       }
     }
   }
@@ -207,6 +221,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                              signal: Signal[A],
                              value: A,
                              ttl: FiniteDuration
-                           )(using SimpleWorkflowContext): Unit =
-    signalStore.setSignalValue(signal, value, ttl)
+                           )(using workflowCtx: SimpleWorkflowContext): Unit =
+    signalStore
+      .bind(WorkflowScope(workflowCtx.meta, workflowCtx.instanceId))
+      .setSignalValue(signal, value, ttl)
 }

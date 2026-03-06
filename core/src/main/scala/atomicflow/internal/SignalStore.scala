@@ -1,13 +1,19 @@
 package atomicflow.internal
 
-import atomicflow.{Signal, SignalConflictException, SimpleWorkflowContext}
+import atomicflow.{Signal, SignalConflictException}
 
 import scala.concurrent.duration.FiniteDuration
 
 trait SignalStore {
-  //@throws[SignalEmptyException]
-  def getSignalValue[A](signal: Signal[A])(using SimpleWorkflowContext): Option[A]
+  def bind(workflowScope: WorkflowScope): SignalStore.Bound
+}
 
-  @throws[SignalConflictException]
-  def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using SimpleWorkflowContext): Unit
+object SignalStore {
+  trait Bound {
+    //@throws[SignalEmptyException]
+    def getSignalValue[A](signal: Signal[A]): Option[A]
+
+    @throws[SignalConflictException]
+    def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit
+  }
 }
