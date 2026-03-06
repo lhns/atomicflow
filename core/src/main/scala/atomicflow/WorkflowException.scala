@@ -1,33 +1,54 @@
 package atomicflow
 
-trait WorkflowException(using workflowCtx: SimpleWorkflowContext) {
+trait WorkflowException {
   self: Exception =>
 
-  def workflowMeta: WorkflowMeta = workflowCtx.meta
+  def workflowMeta: WorkflowMeta
 
-  def workflowInstanceId: WorkflowInstanceId = workflowCtx.instanceId
+  def workflowInstanceId: WorkflowInstanceId
 }
 
-class WorkflowNotFoundException(message: String)
-                               (using SimpleWorkflowContext)
+class WorkflowNotFoundException(
+                                 message: String,
+                                 override val workflowMeta: WorkflowMeta,
+                                 override val workflowInstanceId: WorkflowInstanceId
+                               )
   extends Exception(message) with WorkflowException {
 
   def this()(using workflowCtx: SimpleWorkflowContext) =
-    this(s"Cannot find workflow instance: $workflowCtx")
+    this(
+      s"Cannot find workflow instance: $workflowCtx",
+      workflowCtx.meta,
+      workflowCtx.instanceId
+    )
 }
 
-class WorkflowLockedException(message: String)
-                             (using SimpleWorkflowContext)
+class WorkflowLockedException(
+                               message: String,
+                               override val workflowMeta: WorkflowMeta,
+                               override val workflowInstanceId: WorkflowInstanceId
+                             )
   extends Exception(message) with WorkflowException {
 
   def this()(using workflowCtx: SimpleWorkflowContext) =
-    this(s"Cannot execute locked workflow instance: $workflowCtx")
+    this(
+      s"Cannot execute locked workflow instance: $workflowCtx",
+      workflowCtx.meta,
+      workflowCtx.instanceId
+    )
 }
 
-class WorkflowInputConflictException(message: String)
-                                    (using SimpleWorkflowContext)
+class WorkflowInputConflictException(
+                                      message: String,
+                                      override val workflowMeta: WorkflowMeta,
+                                      override val workflowInstanceId: WorkflowInstanceId
+                                    )
   extends RuntimeException(message) with WorkflowException {
 
   def this()(using workflowCtx: SimpleWorkflowContext) =
-    this(s"Cannot re-run workflow instance with different input: $workflowCtx")
+    this(
+      s"Cannot re-run workflow instance with different input: $workflowCtx",
+      workflowCtx.meta,
+      workflowCtx.instanceId
+    )
 }
