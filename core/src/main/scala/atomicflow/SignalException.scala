@@ -7,36 +7,45 @@ trait SignalException(signal: Signal[?])
   def signalMeta: SignalMeta = signal.meta
 }
 
+object SignalException {
+  def signalRef(signal: Signal[?], workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"${WorkflowException.workflowRef(workflowMeta, workflowInstanceId)}/$signal"
+
+  def emptyMessage(signal: Signal[?], workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"Empty signal value: ${signalRef(signal, workflowMeta, workflowInstanceId)}"
+
+  def conflictMessage(signal: Signal[?], workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"Cannot change signal value: ${signalRef(signal, workflowMeta, workflowInstanceId)}"
+}
+
 class SignalEmptyException(
                             signal: Signal[?],
-                            message: String,
                             override val workflowMeta: WorkflowMeta,
-                            override val workflowInstanceId: WorkflowInstanceId
+                            override val workflowInstanceId: WorkflowInstanceId,
+                            message: String
                           )
   extends Exception(message) with SignalException(signal) {
-
-  def this(signal: Signal[?])(using workflowCtx: SimpleWorkflowContext) =
+  def this(signal: Signal[?], workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId) =
     this(
       signal,
-      s"Empty signal value: $workflowCtx/$signal",
-      workflowCtx.meta,
-      workflowCtx.instanceId
+      workflowMeta,
+      workflowInstanceId,
+      SignalException.emptyMessage(signal, workflowMeta, workflowInstanceId)
     )
 }
 
 class SignalConflictException(
                                signal: Signal[?],
-                               message: String,
                                override val workflowMeta: WorkflowMeta,
-                               override val workflowInstanceId: WorkflowInstanceId
+                               override val workflowInstanceId: WorkflowInstanceId,
+                               message: String
                              )
   extends Exception(message) with SignalException(signal) {
-
-  def this(signal: Signal[?])(using workflowCtx: SimpleWorkflowContext) =
+  def this(signal: Signal[?], workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId) =
     this(
       signal,
-      s"Cannot change signal value: $workflowCtx/$signal)",
-      workflowCtx.meta,
-      workflowCtx.instanceId
+      workflowMeta,
+      workflowInstanceId,
+      SignalException.conflictMessage(signal, workflowMeta, workflowInstanceId)
     )
 }

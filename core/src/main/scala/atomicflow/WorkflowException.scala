@@ -8,47 +8,58 @@ trait WorkflowException {
   def workflowInstanceId: WorkflowInstanceId
 }
 
+object WorkflowException {
+  def workflowRef(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    SimpleWorkflowContext(workflowMeta, workflowInstanceId).toString
+
+  def notFoundMessage(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"Cannot find workflow instance: ${workflowRef(workflowMeta, workflowInstanceId)}"
+
+  def lockedMessage(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"Cannot execute locked workflow instance: ${workflowRef(workflowMeta, workflowInstanceId)}"
+
+  def inputConflictMessage(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): String =
+    s"Cannot re-run workflow instance with different input: ${workflowRef(workflowMeta, workflowInstanceId)}"
+}
+
 class WorkflowNotFoundException(
-                                 message: String,
                                  override val workflowMeta: WorkflowMeta,
-                                 override val workflowInstanceId: WorkflowInstanceId
+                                 override val workflowInstanceId: WorkflowInstanceId,
+                                 message: String
                                )
   extends Exception(message) with WorkflowException {
-
-  def this()(using workflowCtx: SimpleWorkflowContext) =
+  def this(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId) =
     this(
-      s"Cannot find workflow instance: $workflowCtx",
-      workflowCtx.meta,
-      workflowCtx.instanceId
+      workflowMeta,
+      workflowInstanceId,
+      WorkflowException.notFoundMessage(workflowMeta, workflowInstanceId)
     )
 }
 
 class WorkflowLockedException(
-                               message: String,
                                override val workflowMeta: WorkflowMeta,
-                               override val workflowInstanceId: WorkflowInstanceId
+                               override val workflowInstanceId: WorkflowInstanceId,
+                               message: String
                              )
   extends Exception(message) with WorkflowException {
-
-  def this()(using workflowCtx: SimpleWorkflowContext) =
+  def this(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId) =
     this(
-      s"Cannot execute locked workflow instance: $workflowCtx",
-      workflowCtx.meta,
-      workflowCtx.instanceId
+      workflowMeta,
+      workflowInstanceId,
+      WorkflowException.lockedMessage(workflowMeta, workflowInstanceId)
     )
 }
 
 class WorkflowInputConflictException(
-                                      message: String,
                                       override val workflowMeta: WorkflowMeta,
-                                      override val workflowInstanceId: WorkflowInstanceId
+                                      override val workflowInstanceId: WorkflowInstanceId,
+                                      message: String
                                     )
   extends RuntimeException(message) with WorkflowException {
-
-  def this()(using workflowCtx: SimpleWorkflowContext) =
+  def this(workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId) =
     this(
-      s"Cannot re-run workflow instance with different input: $workflowCtx",
-      workflowCtx.meta,
-      workflowCtx.instanceId
+      workflowMeta,
+      workflowInstanceId,
+      WorkflowException.inputConflictMessage(workflowMeta, workflowInstanceId)
     )
 }

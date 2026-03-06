@@ -32,9 +32,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
                                               ): Unit = {
     val id = workflowInstance.instanceId
     val workflowId = workflowInstance.workflow.meta.id
+    val workflowMeta = workflowInstance.workflow.meta
     val input = Cacheable[In].serialize(in).asInstanceOf[Array[Byte]]
-
-    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
     runSync {
       sql"SELECT input FROM workflow_instance WHERE id = $id"
@@ -45,7 +44,10 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
             Monad[ConnectionIO].unit
 
           case Some(_) =>
-            throw WorkflowInputConflictException()(using simpleWorkflowCtx)
+            throw new WorkflowInputConflictException(
+              workflowMeta,
+              id
+            )
 
           case None =>
             sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($id, $workflowId, $input)"
@@ -76,8 +78,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     val lockDuration = java.time.Duration.ofMinutes(5)
     val now = Instant.now()
     val lockUntil = now.plus(lockDuration)
-
-    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
+    val workflowMeta = workflowInstance.workflow.meta
 
     runSync {
       sql"SELECT id, locked_until FROM workflow_instance where id = $id"
@@ -85,10 +86,16 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         .option
         .flatMap {
           case None =>
-            throw WorkflowNotFoundException()(using simpleWorkflowCtx)
+            throw new WorkflowNotFoundException(
+              workflowMeta,
+              id
+            )
 
           case Some((_, Some(lockedUntil))) if now.isBefore(lockedUntil) =>
-            throw WorkflowLockedException()(using simpleWorkflowCtx)
+            throw new WorkflowLockedException(
+              workflowMeta,
+              id
+            )
 
           case Some((_, _)) =>
             sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id"
@@ -120,9 +127,12 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
 
     try {
-      val inputBytes = runSync(loadInput(id)).get /*TODO: .getOrElse {
-        throw WorkflowNotFoundException()(using ctx)
-      }*/
+      val inputBytes = runSync(loadInput(id)).getOrElse {
+        throw new WorkflowNotFoundException(
+          workflowMeta,
+          id
+        )
+      }
       workflowInstance.workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
     } finally {
       val unlock =
@@ -294,7 +304,6 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
         val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
         val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
-        given SimpleWorkflowContext = workflowScope.simpleWorkflowContext
 
         runSync {
           select(workflowScope, signal).flatMap {
@@ -302,7 +311,11 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
               Monad[ConnectionIO].unit
 
             case Some(_) =>
-              throw SignalConflictException(signal)
+              throw new SignalConflictException(
+                signal,
+                workflowScope.workflowMeta,
+                workflowScope.workflowInstanceId
+              )
 
             case None =>
               sql"""
@@ -314,7 +327,10 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
                 WHERE id = ${workflowScope.workflowInstanceId}
               )
               """.update.run.map {
-                case 0 => throw WorkflowNotFoundException()
+                  case 0 => throw new WorkflowNotFoundException(
+                    workflowScope.workflowMeta,
+                    workflowScope.workflowInstanceId
+                  )
                 case 1 => ()
               }
           }

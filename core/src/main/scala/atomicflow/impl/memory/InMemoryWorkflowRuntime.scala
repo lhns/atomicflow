@@ -116,7 +116,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
       instances.get(workflowInstance.instanceId) match {
         case Some(state) =>
           if (state.in != in) {
-            throw new WorkflowInputConflictException()
+            throw new WorkflowInputConflictException(
+              workflowInstance.workflow.meta,
+              workflowInstance.instanceId
+            )
           } else {
             instances
           }
@@ -157,7 +160,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
       case Some(state: WorkflowState[In, Out] @unchecked) =>
         if (state.locked.getAndSet(true)) {
           // was locked before
-          throw new WorkflowLockedException()
+          throw new WorkflowLockedException(
+            workflowInstance.workflow.meta,
+            workflowInstance.instanceId
+          )
         } else {
           // was not locked before
           try {
@@ -187,7 +193,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         }
 
       case _ =>
-        throw new WorkflowNotFoundException()
+        throw new WorkflowNotFoundException(
+          workflowInstance.workflow.meta,
+          workflowInstance.instanceId
+        )
     }
   }
 
@@ -202,14 +211,20 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
       override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
         val key = (workflowScope.workflowMeta.id, workflowScope.workflowInstanceId, signal.meta.id)
-        given SimpleWorkflowContext = workflowScope.simpleWorkflowContext
 
         if (!workflowInstances.get().contains(workflowScope.workflowInstanceId))
-          throw new WorkflowNotFoundException()
+          throw new WorkflowNotFoundException(
+            workflowScope.workflowMeta,
+            workflowScope.workflowInstanceId
+          )
 
         signalValues.updateAndGet { map =>
           if (map.get(key).exists(_ != value))
-            throw new SignalConflictException(signal)
+            throw new SignalConflictException(
+              signal,
+              workflowScope.workflowMeta,
+              workflowScope.workflowInstanceId
+            )
 
           map + (key -> value)
         }

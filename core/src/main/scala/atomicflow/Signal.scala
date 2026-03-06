@@ -15,8 +15,8 @@ trait Signal[A] {
   def isEmpty(using WorkflowContext[?, ?]): Boolean = option.isEmpty
 
   @throws[SignalEmptyException]
-  def value(using WorkflowContext[?, ?]): A =
-    option.getOrElse(throw new SignalEmptyException(this))
+  def value(using workflowCtx: WorkflowContext[?, ?]): A =
+    option.getOrElse(throw new SignalEmptyException(this, workflowCtx.meta, workflowCtx.instanceId))
 
   /*@throws[SignalConflictException]
   def set(value: A)(using WorkflowContext[?, ?]): Unit*/
