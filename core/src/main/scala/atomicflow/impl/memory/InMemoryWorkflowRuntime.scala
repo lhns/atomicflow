@@ -170,6 +170,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                 workflowInstance.defaultCacheTtl
             }
             state.workflowInstance.workflow.body(ctx, state.in)
+            // TODO: set to clean state
           } finally {
             state.locked.set(false)
           }
