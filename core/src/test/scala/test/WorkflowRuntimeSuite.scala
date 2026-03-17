@@ -3,8 +3,7 @@ package test
 import atomicflow.WorkflowRuntime
 import munit.*
 import atomicflow.{*, given}
-import upickle.default.given
-import Cacheable.MsgPack.given
+import Cacheable.Simple.given
 
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -24,13 +23,13 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Unknown empty workflow should fail with WorkflowNotFoundException") {
-    intercept[WorkflowNotFoundException] {
-      emptyWorkflow.instance(WorkflowInstanceId.generate).recover()
+    intercept[WorkflowError.NotFound] {
+      emptyWorkflow.recover(WorkflowInstanceId.generate)
     }
   }
 
   test("Empty workflow should run") {
-    assertEquals(emptyWorkflow.instance(WorkflowInstanceId.generate).run("answer"), 42)
+    assertEquals(emptyWorkflow.run(WorkflowInstanceId.generate, "answer"), 42)
   }
 
   test("Locked empty workflow should fail with WorkflowLockedException") {
@@ -39,18 +38,18 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"),
       name = "recursive workflow"
     ) { _ =>
-      intercept[WorkflowLockedException] {
-        workflow.instance(instanceId).recover()
+      intercept[WorkflowError.Locked] {
+        workflow.recover(instanceId)
       }
     }
-    workflow.instance(instanceId).run(())
+    workflow.run(instanceId, ())
   }
 
   test("Empty workflow should fail with WorkflowInputConflictException if its inputs change") {
     val workflowInstanceId = WorkflowInstanceId.generate
-    assertEquals(emptyWorkflow.instance(workflowInstanceId).run("answer"), 42)
-    intercept[WorkflowInputConflictException] {
-      emptyWorkflow.instance(workflowInstanceId).run("hello")
+    assertEquals(emptyWorkflow.run(workflowInstanceId, "answer"), 42)
+    intercept[WorkflowError.InputConflict] {
+      emptyWorkflow.run(workflowInstanceId, "hello")
     }
   }
 
@@ -59,7 +58,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("15f8bf6d-a719-4958-b790-b3eb846340c1"),
       name = "workflow with steps"
     ) { (string: String) =>
-      Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
+      Step["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0] {
         if (string == "answer")
           42
         else
@@ -69,9 +68,9 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
   }
 
   test("Workflow with cached step should run") {
@@ -81,11 +80,9 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("15f8bf6d-a719-4958-b790-b3eb846340c1"),
       name = "workflow with cached steps"
     ) { (string: String) =>
-      Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
-        Step.cache(
-          "input" -> string
-        )
-
+      Step.cached["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+        "input" -> string
+      ) {
         if (string == "answer")
           answer.getAndIncrement()
         else
@@ -95,11 +92,11 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 43)
+    assertEquals(workflow.run(WorkflowInstanceId.generate, "answer"), 43)
   }
 
   test("Workflow with cached step and changed inputs should run") {
@@ -109,16 +106,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("330be340-1958-427d-8baf-0f7562d53a97"),
       name = "workflow with cached steps, changed inputs"
     ) { (string: String) =>
-      val a = Step(StepId("0bc4b603-81ec-4af2-a6c5-700df0084243"), 0) {
+      val a = Step["0bc4b603-81ec-4af2-a6c5-700df0084243", 0] {
         answer.getAndIncrement()
       }
 
-      Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
-        Step.cache(
-          "input" -> string,
-          "a" -> a
-        )
-
+      Step.cached["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+        "input" -> string,
+        "a" -> a
+      ) {
         if (string == "answer")
           a
         else
@@ -128,11 +123,11 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 43)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 43)
 
-    assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 44)
+    assertEquals(workflow.run(WorkflowInstanceId.generate, "answer"), 44)
   }
 
   test("Workflow with once step should run") {
@@ -142,11 +137,9 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("72b29e07-46ad-4b95-b591-cea2a4dbffce"),
       name = "workflow with once steps"
     ) { (string: String) =>
-      Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
-        Step.onlyOnce(
-          "input" -> string
-        )
-
+      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+        "input" -> string
+      ) {
         if (string == "answer")
           answer.getAndIncrement()
         else
@@ -156,11 +149,11 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
-    assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 43)
+    assertEquals(workflow.run(WorkflowInstanceId.generate, "answer"), 43)
   }
 
   test("Workflow with once step and changed inputs should run") {
@@ -170,16 +163,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       WorkflowId("a8d67a06-d4e2-4d20-8088-002fca20f789"),
       name = "workflow with once steps, changed inputs"
     ) { (string: String) =>
-      val a = Step(StepId("0bc4b603-81ec-4af2-a6c5-700df0084243"), 0) {
+      val a = Step["0bc4b603-81ec-4af2-a6c5-700df0084243", 0] {
         answer.get()
       }
 
-      Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
-        Step.onlyOnce(
-          "input" -> string,
-          "a" -> a
-        )
-
+      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+        "input" -> string,
+        "a" -> a
+      ) {
         if (string == "answer")
           a
         else
@@ -189,29 +180,30 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 42)
 
     answer.incrementAndGet()
 
-    intercept[StepInputConflictException] {
-      workflow.instance(workflowInstanceId).run("answer")
+    intercept[WorkflowError.StepConflict] {
+      workflow.run(workflowInstanceId, "answer")
     }
 
     assertEquals(
-      workflow.instance(workflowInstanceId)
-        .overrideStepIdempotencyId(
-          StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"),
-          StepIdempotencyId.generate
+      workflow.run(
+        workflowInstanceId,
+        "answer",
+        stepIdempotencyIdOverrides = Map(
+          StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7") -> StepIdempotencyId.generate
         )
-        .run("answer"),
+      ),
       43
     )
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 43)
+    assertEquals(workflow.run(workflowInstanceId, "answer"), 43)
 
     answer.incrementAndGet()
 
-    assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 44)
+    assertEquals(workflow.run(WorkflowInstanceId.generate, "answer"), 44)
   }
 
   test("Signals can be set but not to a different value") {
@@ -227,18 +219,18 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    intercept[SignalEmptyException] {
-      workflow.instance(workflowInstanceId).run()
+    intercept[WorkflowError.SignalEmpty] {
+      workflow.run(workflowInstanceId)
     }
 
-    workflow.instance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test")
 
-    assertEquals(workflow.instance(workflowInstanceId).run(), "test")
+    assertEquals(workflow.run(workflowInstanceId), "test")
 
-    workflow.instance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test")
 
-    intercept[SignalConflictException] {
-      workflow.instance(workflowInstanceId).setSignal(signal, "test2")
+    intercept[WorkflowError.SignalConflict] {
+      workflow.setSignal(workflowInstanceId, signal, "test2")
     }
   }
 
@@ -255,12 +247,12 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val workflowInstanceId = WorkflowInstanceId.generate
 
-    intercept[WorkflowNotFoundException] {
-      workflow.instance(workflowInstanceId).setSignal(signal, "test")
+    intercept[WorkflowError.NotFound] {
+      workflow.setSignal(workflowInstanceId, signal, "test")
     }
 
-    workflow.instance(workflowInstanceId).create()
+    workflow.create(workflowInstanceId)
 
-    workflow.instance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test")
   }
 }

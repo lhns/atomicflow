@@ -10,7 +10,7 @@ trait WorkflowRuntime {
 
   def generateStepIdempotencyId: StepIdempotencyId
 
-  @throws[WorkflowInputConflictException]
+  @throws[WorkflowError.InputConflict]
   def createWorkflowInstance[In, Out](
                                        workflowInstance: WorkflowInstanceBuilder[In, Out],
                                        in: In
@@ -21,7 +21,7 @@ trait WorkflowRuntime {
   /**
    * - Must lock the workflow while running
    */
-  @throws[WorkflowInputConflictException]
+  @throws[WorkflowError.InputConflict]
   def runWorkflowInstance[In, Out](
                                     workflowInstance: WorkflowInstanceBuilder[In, Out],
                                     in: In
@@ -31,22 +31,24 @@ trait WorkflowRuntime {
 
   /**
    * - Must lock the workflow while running
-   * - Must throw a WorkflowNotFoundException
+   * - Must throw a WorkflowError.NotFound
    */
-  @throws[WorkflowNotFoundException]
+  @throws[WorkflowError.NotFound]
   def recoverWorkflowInstance[In, Out](
                                         workflowInstance: WorkflowInstanceBuilder[In, Out]
                                       )(
                                         using Cacheable[In]
                                       ): Out
 
-  @throws[WorkflowNotFoundException]
-  @throws[SignalConflictException]
+  @throws[WorkflowError.NotFound]
+  @throws[WorkflowError.SignalConflict]
   def setSignal[A](
                     signal: Signal[A],
                     value: A,
-                    ttl: FiniteDuration
-                  )(using SimpleWorkflowContext): Unit
+                    ttl: FiniteDuration,
+                    workflowMeta: WorkflowMeta,
+                    workflowInstanceId: WorkflowInstanceId
+                  ): Unit
 }
 
 object WorkflowRuntime {

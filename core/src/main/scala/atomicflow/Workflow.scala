@@ -1,25 +1,84 @@
 package atomicflow
 
-import atomicflow.Workflow.*
+import scala.compiletime.constValue
+import scala.concurrent.TimeoutException
+import scala.concurrent.duration.FiniteDuration
 
-case class Workflow[In: Cacheable, Out] private(
+case class Workflow[In: Cacheable, Out] private[atomicflow](
                                                  meta: WorkflowMeta,
-                                                 body: (WorkflowContext[In, Out], In) => Out
+                                                 body: (WorkflowContext, In) => Out
                                                ) {
-  def instance(instanceId: WorkflowInstanceId): WorkflowInstanceBuilder[In, Out] =
+  private[atomicflow] def instance(instanceId: WorkflowInstanceId): WorkflowInstanceBuilder[In, Out] =
     WorkflowInstanceBuilder(
       this,
       instanceId
     )
+
+  @throws[WorkflowError.InputConflict]
+  def run(
+           instanceId: WorkflowInstanceId,
+           in: In,
+           cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
+           signalTtl: FiniteDuration = Constants.defaultSignalTtl,
+           stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+         )(using WorkflowRuntime): Out =
+    WorkflowInstanceBuilder(this, instanceId, cacheTtl, signalTtl, stepIdempotencyIdOverrides).run(in)
+
+  @throws[WorkflowError.InputConflict]
+  inline def run(
+           instanceId: WorkflowInstanceId
+         )(using WorkflowRuntime, Unit =:= In): Out =
+    run(instanceId, ())
+
+  @throws[WorkflowError.InputConflict]
+  def create(
+              instanceId: WorkflowInstanceId,
+              in: In,
+              cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
+              signalTtl: FiniteDuration = Constants.defaultSignalTtl,
+              stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+            )(using WorkflowRuntime): Unit =
+    WorkflowInstanceBuilder(this, instanceId, cacheTtl, signalTtl, stepIdempotencyIdOverrides).create(in)
+
+  @throws[WorkflowError.InputConflict]
+  inline def create(
+              instanceId: WorkflowInstanceId
+            )(using WorkflowRuntime, Unit =:= In): Unit =
+    create(instanceId, ())
+
+  @throws[WorkflowError.NotFound]
+  def recover(
+               instanceId: WorkflowInstanceId,
+               cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
+               signalTtl: FiniteDuration = Constants.defaultSignalTtl,
+               stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+             )(using WorkflowRuntime): Out =
+    WorkflowInstanceBuilder(this, instanceId, cacheTtl, signalTtl, stepIdempotencyIdOverrides).recover()
+
+  @throws[WorkflowError.NotFound]
+  @throws[WorkflowError.SignalConflict]
+  def setSignal[A](
+                    instanceId: WorkflowInstanceId,
+                    signal: Signal[A],
+                    value: A,
+                    signalTtl: FiniteDuration = Constants.defaultSignalTtl
+                  )(using WorkflowRuntime): Unit =
+    WorkflowInstanceBuilder(this, instanceId, defaultSignalTtl = signalTtl).setSignal(signal, value)
 }
 
 object Workflow {
+  inline def apply[UUID <: String & Singleton, Name <: String & Singleton]: WorkflowBuilder =
+    new WorkflowBuilder(
+      WorkflowId.unsafeMake(UUIDMacros.validateUUID(constValue[UUID])),
+      constValue[Name]
+    )
+
   def apply[In: Cacheable, Out](
                                  id: WorkflowId,
                                  name: String,
                                  description: String | Unit = ()
                                )(
-                                 body: In => WorkflowContext[In, Out] ?=> Out
+                                 body: In => WorkflowContext ?=> Out
                                ): Workflow[In, Out] = {
     val workflowMeta = WorkflowMeta(
       id = id,
@@ -32,22 +91,13 @@ object Workflow {
 
     new Workflow[In, Out](
       meta = workflowMeta,
-      body = { (ctx: WorkflowContext[In, Out], in: In) =>
+      body = { (ctx: WorkflowContext, in: In) =>
         body(in)(using ctx)
       }
     )
   }
 
-  /*def apply[Out](
-                  id: WorkflowId,
-                  name: String,
-                  description: String | Unit = ()
-                )(
-                  body: () => WorkflowContext[Unit, Out] ?=> Out
-                ): Workflow[Unit, Out] =
-    apply[Unit, Out](id, name, description)(_ => body())*/
+  def meta(using ctx: WorkflowContext): WorkflowMeta = ctx.meta
 
-  def meta[In, Out](using ctx: WorkflowContext[In, Out]): WorkflowMeta = ctx.meta
-
-  def instanceId[In, Out](using ctx: WorkflowContext[In, Out]): WorkflowInstanceId = ctx.instanceId
+  def instanceId(using ctx: WorkflowContext): WorkflowInstanceId = ctx.instanceId
 }

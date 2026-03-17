@@ -8,18 +8,18 @@ trait Signal[A] {
 
   def cacheable: Cacheable[A]
 
-  def option(using WorkflowContext[?, ?]): Option[A]
+  def option(using WorkflowContext): Option[A]
 
-  def isDefined(using WorkflowContext[?, ?]): Boolean = option.isDefined
+  def isDefined(using WorkflowContext): Boolean = option.isDefined
 
-  def isEmpty(using WorkflowContext[?, ?]): Boolean = option.isEmpty
+  def isEmpty(using WorkflowContext): Boolean = option.isEmpty
 
-  @throws[SignalEmptyException]
-  def value(using workflowCtx: WorkflowContext[?, ?]): A =
-    option.getOrElse(throw new SignalEmptyException(this, workflowCtx.meta, workflowCtx.instanceId))
+  @throws[WorkflowError.SignalEmpty]
+  def value(using workflowCtx: WorkflowContext): A =
+    option.getOrElse(throw WorkflowError.SignalEmpty(workflowCtx.meta, workflowCtx.instanceId, this))
 
   /*@throws[SignalConflictException]
-  def set(value: A)(using WorkflowContext[?, ?]): Unit*/
+  def set(value: A)(using WorkflowContext): Unit*/
 
   override def toString: String = s"signal:${meta.id}${meta.name.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
 }
@@ -45,10 +45,10 @@ object Signal {
 
       override def cacheable: Cacheable[A] = A
 
-      override def option(using workflowCtx: WorkflowContext[?, ?]): Option[A] =
+      override def option(using workflowCtx: WorkflowContext): Option[A] =
         workflowCtx.getSignalStore.getSignalValue(this)
 
-      /*override def set(value: A)(using workflowCtx: WorkflowContext[?, ?]): Unit =
+      /*override def set(value: A)(using workflowCtx: WorkflowContext): Unit =
         workflowCtx.getSignalStore.setSignalValue(this, value)*/
     }
   }

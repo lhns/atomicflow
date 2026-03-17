@@ -1,11 +1,10 @@
 package atomicflow
 
-import neotype.*
+opaque type WorkflowId = String
 
-type WorkflowId = WorkflowId.Type
-
-object WorkflowId extends Newtype[String] {
-  override inline def validate(input: String): Boolean | String =
-    if (input.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) true
-    else "Should be a UUID"
+object WorkflowId {
+  inline def apply(inline s: String): WorkflowId = UUIDMacros.validateUUID(s)
+  def unsafeMake(s: String): WorkflowId = s
+  def unwrap(id: WorkflowId): String = id
+  extension (id: WorkflowId) def value: String = id
 }

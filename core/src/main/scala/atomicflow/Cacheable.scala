@@ -2,12 +2,9 @@ package atomicflow
 
 import cats.Invariant
 import cats.syntax.all.*
-import upickle.default.*
 
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Path, Paths}
-import java.time.*
 import scala.collection.mutable.ListBuffer
 
 trait Cacheable[A] {
@@ -46,6 +43,11 @@ object Cacheable {
 
     given Cacheable[Float] = Cacheable[String].imap(_.toFloat)(_.toString)
 
+    given Cacheable[Unit] = new Cacheable[Unit] {
+      override def serialize(value: Unit): IArray[Byte] = IArray.empty[Byte]
+      override def deserialize(bytes: IArray[Byte]): Unit = ()
+    }
+
     given [A: Cacheable]: Cacheable[Seq[A]] = new Cacheable[Seq[A]] {
       override def serialize(value: Seq[A]): IArray[Byte] = {
         val baos = new ByteArrayOutputStream()
@@ -71,27 +73,5 @@ object Cacheable {
         listBuffer.toSeq
       }
     }
-  }
-
-  object MsgPack {
-    given [A: {Writer, Reader}]: Cacheable[A] = new Cacheable[A] {
-      override def serialize(value: A): IArray[Byte] =
-        writeBinary(value).asInstanceOf[IArray[Byte]]
-
-      override def deserialize(bytes: IArray[Byte]): A =
-        readBinary[A](bytes.asInstanceOf[Array[Byte]])
-    }
-
-    given Cacheable[Path] = Cacheable[String].imap(Paths.get(_))(_.toString)
-
-    given Cacheable[Instant] = Cacheable[String].imap(Instant.parse)(_.toString)
-
-    given Cacheable[LocalDate] = Cacheable[String].imap(LocalDate.parse)(_.toString)
-
-    given Cacheable[LocalDateTime] = Cacheable[String].imap(LocalDateTime.parse)(_.toString)
-
-    given Cacheable[OffsetDateTime] = Cacheable[String].imap(OffsetDateTime.parse)(_.toString)
-
-    given Cacheable[ZonedDateTime] = Cacheable[String].imap(ZonedDateTime.parse)(_.toString)
   }
 }

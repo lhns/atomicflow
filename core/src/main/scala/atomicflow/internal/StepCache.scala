@@ -1,91 +1,23 @@
 package atomicflow.internal
 
 import atomicflow.internal.StepInputFingerprints
-import atomicflow.{Cacheable, StepIdempotencyId, StepInputConflictException}
+import atomicflow.{Cacheable, StepIdempotencyId, WorkflowError}
 
 import scala.concurrent.duration.FiniteDuration
 
-/*
-trait StepCache {
-  self =>
-
-  // TODO: throw conflict exception
-  def get[Out](
-                workflowId: WorkflowId,
-                workflowInstanceId: WorkflowInstanceId,
-                stepIdempotencyId: StepIdempotencyId,
-                stepVersion: Long,
-                stepInputs: Seq[StepInput[?]]
-              ): Option[Out]
-
-  def put[Out](
-                workflowId: WorkflowId,
-                workflowInstanceId: WorkflowInstanceId,
-                stepIdempotencyId: StepIdempotencyId,
-                stepVersion: Long,
-                stepInputs: Seq[StepInput[?]],
-                value: Out,
-                ttl: FiniteDuration
-              ): Unit
-
-  final def withWorkflowInstance(
-                                  workflowId: WorkflowId,
-                                  workflowInstanceId: WorkflowInstanceId,
-                                  defaultTtl: FiniteDuration
-                                ): WithWorkflow = new WithWorkflow {
-    override def get[Out](
-                           stepIdempotencyId: StepIdempotencyId,
-                           stepVersion: Long,
-                           stepInputs: Seq[StepInput[?]]
-                         ): Option[Out] =
-      self.get[Out](
-        workflowId = workflowId,
-        workflowInstanceId = workflowInstanceId,
-        stepIdempotencyId = stepIdempotencyId,
-        stepVersion = stepVersion,
-        stepInputs = stepInputs
-      )
-
-    override def put[Out](
-                           stepIdempotencyId: StepIdempotencyId,
-                           stepVersion: Long,
-                           stepInputs: Seq[StepInput[?]],
-                           value: Out,
-                           ttl: Option[FiniteDuration]
-                         ): Unit =
-      self.put[Out](
-        workflowId = workflowId,
-        workflowInstanceId = workflowInstanceId,
-        stepIdempotencyId = stepIdempotencyId,
-        stepVersion = stepVersion,
-        stepInputs = stepInputs,
-        value = value,
-        ttl = ttl.getOrElse(defaultTtl)
-      )
-  }
-}
-*/
 trait StepCache {
   def bind[Out: Cacheable](stepScope: StepScope): StepCache.Bound[Out]
 }
 
 object StepCache {
   trait Bound[Out] {
-    /**
-     * the output value should be retrieved by the stepIdempotencyId. The stepVersion and stepInputs should be compared on
-     * retrieval and should throw a StepInputConflictException if they don't match
-     */
-    @throws[StepInputConflictException]
+    @throws[WorkflowError.StepConflict]
     def get(
              stepIdempotencyId: StepIdempotencyId,
              inputFingerprints: StepInputFingerprints
            ): Option[Out]
 
-    /**
-     * the output value should be cached by the stepIdempotencyId. The stepVersion and stepInputs should be compared on put
-     * and should throw a StepInputConflictException if they don't match
-     */
-    @throws[StepInputConflictException]
+    @throws[WorkflowError.StepConflict]
     def put(
              stepIdempotencyId: StepIdempotencyId,
              inputFingerprints: StepInputFingerprints,

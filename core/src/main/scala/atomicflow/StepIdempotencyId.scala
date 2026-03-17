@@ -1,13 +1,12 @@
 package atomicflow
 
-import neotype.*
+opaque type StepIdempotencyId = String
 
-type StepIdempotencyId = StepIdempotencyId.Type
-
-object StepIdempotencyId extends Newtype[String] {
-  override inline def validate(input: String): Boolean | String =
-    if (input.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) true
-    else "Should be a UUID"
+object StepIdempotencyId {
+  inline def apply(inline s: String): StepIdempotencyId = UUIDMacros.validateUUID(s)
+  def unsafeMake(s: String): StepIdempotencyId = s
+  def unwrap(id: StepIdempotencyId): String = id
+  extension (id: StepIdempotencyId) def value: String = id
 
   def generate(using runtime: WorkflowRuntime): StepIdempotencyId =
     runtime.generateStepIdempotencyId

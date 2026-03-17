@@ -62,7 +62,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         val stepVersion = stepScope.stepMeta.version
         stepCache.get().get(stepIdempotencyId).map {
           case (`stepId`, `stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
-          case _ => throw stepScope.stepInputConflictException()
+          case _ => throw stepScope.stepConflictError()
         }
       }
 
@@ -80,7 +80,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
           cache.get(stepIdempotencyId) match {
             case Some((existingStepId, existingStepVersion, existingFingerprints, _))
               if existingStepId != stepId || existingStepVersion != stepVersion || existingFingerprints != inputFingerprints =>
-              throw stepScope.stepInputConflictException()
+              throw stepScope.stepConflictError()
 
             case _ =>
               cache + (stepIdempotencyId -> (stepId, stepVersion, inputFingerprints, value))
@@ -106,17 +106,11 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                                               )(
                                                                 using Cacheable[WorkflowIn]
                                                               ): Unit = {
-    given SimpleWorkflowContext {
-      override def meta: WorkflowMeta = workflowInstance.workflow.meta
-
-      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
-    }
-
     workflowInstances.updateAndGet { instances =>
       instances.get(workflowInstance.instanceId) match {
         case Some(state) =>
           if (state.in != in) {
-            throw new WorkflowInputConflictException(
+            throw WorkflowError.InputConflict(
               workflowInstance.workflow.meta,
               workflowInstance.instanceId
             )
@@ -150,24 +144,16 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                                )(
                                                  using Cacheable[In]
                                                ): Out = {
-    given SimpleWorkflowContext {
-      override def meta: WorkflowMeta = workflowInstance.workflow.meta
-
-      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
-    }
-
     workflowInstances.get().get(workflowInstance.instanceId) match {
       case Some(state: WorkflowState[In, Out] @unchecked) =>
         if (state.locked.getAndSet(true)) {
-          // was locked before
-          throw new WorkflowLockedException(
+          throw WorkflowError.Locked(
             workflowInstance.workflow.meta,
             workflowInstance.instanceId
           )
         } else {
-          // was not locked before
           try {
-            val ctx = new WorkflowContext[In, Out] {
+            val ctx = new WorkflowContext {
               override val meta: WorkflowMeta = workflowInstance.workflow.meta
 
               override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
@@ -193,7 +179,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         }
 
       case _ =>
-        throw new WorkflowNotFoundException(
+        throw WorkflowError.NotFound(
           workflowInstance.workflow.meta,
           workflowInstance.instanceId
         )
@@ -213,17 +199,17 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         val key = (workflowScope.workflowMeta.id, workflowScope.workflowInstanceId, signal.meta.id)
 
         if (!workflowInstances.get().contains(workflowScope.workflowInstanceId))
-          throw new WorkflowNotFoundException(
+          throw WorkflowError.NotFound(
             workflowScope.workflowMeta,
             workflowScope.workflowInstanceId
           )
 
         signalValues.updateAndGet { map =>
           if (map.get(key).exists(_ != value))
-            throw new SignalConflictException(
-              signal,
+            throw WorkflowError.SignalConflict(
               workflowScope.workflowMeta,
-              workflowScope.workflowInstanceId
+              workflowScope.workflowInstanceId,
+              signal
             )
 
           map + (key -> value)
@@ -235,9 +221,11 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   override def setSignal[A](
                              signal: Signal[A],
                              value: A,
-                             ttl: FiniteDuration
-                           )(using workflowCtx: SimpleWorkflowContext): Unit =
+                             ttl: FiniteDuration,
+                             workflowMeta: WorkflowMeta,
+                             workflowInstanceId: WorkflowInstanceId
+                           ): Unit =
     signalStore
-      .bind(WorkflowScope(workflowCtx.meta, workflowCtx.instanceId))
+      .bind(WorkflowScope(workflowMeta, workflowInstanceId))
       .setSignalValue(signal, value, ttl)
 }

@@ -3,6 +3,7 @@ package atomicflow.impl.db
 import atomicflow.*
 import atomicflow.Constants.libraryVersion
 import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.impl.db.CirceCodecs.given
 import atomicflow.impl.db.DbWorkflowRuntime.given
 import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, WorkflowScope}
 import cats.Monad
@@ -44,7 +45,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
             Monad[ConnectionIO].unit
 
           case Some(_) =>
-            throw new WorkflowInputConflictException(
+            throw WorkflowError.InputConflict(
               workflowMeta,
               id
             )
@@ -86,13 +87,13 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         .option
         .flatMap {
           case None =>
-            throw new WorkflowNotFoundException(
+            throw WorkflowError.NotFound(
               workflowMeta,
               id
             )
 
           case Some((_, Some(lockedUntil))) if now.isBefore(lockedUntil) =>
-            throw new WorkflowLockedException(
+            throw WorkflowError.Locked(
               workflowMeta,
               id
             )
@@ -105,7 +106,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         }
     }
 
-    val ctx = new atomicflow.WorkflowContext[In, Out] {
+    val ctx = new atomicflow.WorkflowContext {
       override val meta: WorkflowMeta = workflowInstance.workflow.meta
 
       override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
@@ -128,7 +129,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 
     try {
       val inputBytes = runSync(loadInput(id)).getOrElse {
-        throw new WorkflowNotFoundException(
+        throw WorkflowError.NotFound(
           workflowMeta,
           id
         )
@@ -242,7 +243,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       runSync(query).flatMap {
         case (data, version, fingerprints) if version == stepScope.stepMeta.version && fingerprints == inputFingerprints =>
           Some(Cacheable[Out].deserialize(data.asInstanceOf[IArray[Byte]]))
-        case _ => throw stepScope.stepInputConflictException()
+        case _ => throw stepScope.stepConflictError()
       }
     }
 
@@ -275,7 +276,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       runSync(existingQuery).foreach {
         case (existingVersion, existingFingerprints)
           if existingVersion != stepScope.stepMeta.version || existingFingerprints != inputFingerprints =>
-          throw stepScope.stepInputConflictException()
+          throw stepScope.stepConflictError()
         case _ =>
       }
 
@@ -300,7 +301,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
           signal.cacheable.deserialize(bytes.asInstanceOf[IArray[Byte]])
         }
 
-      @throws[SignalConflictException]
+      @throws[WorkflowError.SignalConflict]
       override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
         val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
         val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
@@ -311,10 +312,10 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
               Monad[ConnectionIO].unit
 
             case Some(_) =>
-              throw new SignalConflictException(
-                signal,
+              throw WorkflowError.SignalConflict(
                 workflowScope.workflowMeta,
-                workflowScope.workflowInstanceId
+                workflowScope.workflowInstanceId,
+                signal
               )
 
             case None =>
@@ -327,7 +328,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
                 WHERE id = ${workflowScope.workflowInstanceId}
               )
               """.update.run.map {
-                  case 0 => throw new WorkflowNotFoundException(
+                  case 0 => throw WorkflowError.NotFound(
                     workflowScope.workflowMeta,
                     workflowScope.workflowInstanceId
                   )
@@ -342,10 +343,10 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
   private def runSync[A](fa: ConnectionIO[A]): A =
     dispatcher.unsafeRunSync(fa.transact(xa))
 
-  @throws[SignalConflictException]
-  override def setSignal[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: SimpleWorkflowContext): Unit =
+  @throws[WorkflowError.SignalConflict]
+  override def setSignal[A](signal: Signal[A], value: A, ttl: FiniteDuration, workflowMeta: WorkflowMeta, workflowInstanceId: WorkflowInstanceId): Unit =
     DbSignalStore
-      .bind(WorkflowScope(workflowCtx.meta, workflowCtx.instanceId))
+      .bind(WorkflowScope(workflowMeta, workflowInstanceId))
       .setSignalValue(signal, value, ttl)
 }
 

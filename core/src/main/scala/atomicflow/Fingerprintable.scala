@@ -3,7 +3,6 @@ package atomicflow
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 import cats.Contravariant
 import cats.syntax.all.*
-import io.circe.Codec
 
 import java.util
 import java.util.Base64
@@ -43,8 +42,6 @@ object Fingerprintable {
   object Fingerprint {
     def fromString(string: String): Fingerprint =
       Fingerprint(Base64.getDecoder.decode(string).asInstanceOf[IArray[Byte]])
-
-    given Codec[Fingerprint] = Codec.implied[String].imap(fromString)(_.toString)
   }
 
   trait Fingerprinter {

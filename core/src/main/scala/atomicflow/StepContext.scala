@@ -7,13 +7,12 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import scala.annotation.implicitNotFound
 
-@implicitNotFound("Cannot be used outside a Step definition: `Step(...) {  }`\nYou can require a StepContext for the enclosing method by adding a using clause `(using StepContext)` to its definition.")
-trait StepContext[Out] {
+private[atomicflow] trait StepContext[Out] {
   def stepScope: StepScope
 
   final def meta: StepMeta = stepScope.stepMeta
 
-  def workflowCtx: WorkflowContext[?, ?]
+  def workflowCtx: WorkflowContext
 
   override lazy val toString: String = s"$workflowCtx/step:${meta.id}${meta.name.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
 
