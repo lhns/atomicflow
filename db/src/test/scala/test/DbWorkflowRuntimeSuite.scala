@@ -28,34 +28,39 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     private def unavailable[A]: A =
       throw new IllegalStateException(skipReason)
 
-    override def createWorkflowInstance[In, Out](
-                                                  workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                                  in: In
-                                                )(
-                                                  using Cacheable[In]
-                                                ): Unit =
+    override def createWorkflowInstance[In: Cacheable, Out](
+      workflow: Workflow[In, Out],
+      instanceId: WorkflowInstanceId,
+      in: In,
+      defaultCacheTtl: FiniteDuration,
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    ): Unit =
       unavailable
 
-    override def runWorkflowInstance[In, Out](
-                                               workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                               in: In
-                                             )(
-                                               using Cacheable[In]
-                                             ): Out =
+    override def runWorkflowInstance[In: Cacheable, Out](
+      workflow: Workflow[In, Out],
+      instanceId: WorkflowInstanceId,
+      in: In,
+      defaultCacheTtl: FiniteDuration,
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    ): Out =
       unavailable
 
-    override def recoverWorkflowInstance[In, Out](
-                                                   workflowInstance: WorkflowInstanceBuilder[In, Out]
-                                                 )(
-                                                   using Cacheable[In]
-                                                 ): Out =
+    override def recoverWorkflowInstance[In: Cacheable, Out](
+      workflow: Workflow[In, Out],
+      instanceId: WorkflowInstanceId,
+      defaultCacheTtl: FiniteDuration,
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    ): Out =
       unavailable
 
     override def setSignal[A](
                                signal: Signal[A],
                                value: A,
-                               ttl: FiniteDuration
-                             )(using SimpleWorkflowContext): Unit =
+                               ttl: FiniteDuration,
+                               workflowMeta: WorkflowMeta,
+                               workflowInstanceId: WorkflowInstanceId
+                             ): Unit =
       unavailable
   }
 

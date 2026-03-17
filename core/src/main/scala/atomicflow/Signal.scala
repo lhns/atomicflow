@@ -2,11 +2,14 @@ package atomicflow
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import scala.concurrent.duration.FiniteDuration
 
 trait Signal[A] {
   def meta: SignalMeta
 
   def cacheable: Cacheable[A]
+
+  def ttl: FiniteDuration
 
   def option(using WorkflowContext): Option[A]
 
@@ -18,9 +21,6 @@ trait Signal[A] {
   def value(using workflowCtx: WorkflowContext): A =
     option.getOrElse(throw WorkflowError.SignalEmpty(workflowCtx.meta, workflowCtx.instanceId, this))
 
-  /*@throws[SignalConflictException]
-  def set(value: A)(using WorkflowContext): Unit*/
-
   override def toString: String = s"signal:${meta.id}${meta.name.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
 }
 
@@ -28,7 +28,8 @@ object Signal {
   def apply[A: Cacheable as A](
                                 id: SignalId,
                                 name: String | Unit = (),
-                                description: String | Unit = ()
+                                description: String | Unit = (),
+                                ttl: FiniteDuration = Constants.defaultSignalTtl
                               ): Signal[A] = {
     new Signal[A] {
       override val meta: SignalMeta = SignalMeta(
@@ -43,13 +44,12 @@ object Signal {
         }
       )
 
+      override val ttl: FiniteDuration = ttl
+
       override def cacheable: Cacheable[A] = A
 
       override def option(using workflowCtx: WorkflowContext): Option[A] =
         workflowCtx.getSignalStore.getSignalValue(this)
-
-      /*override def set(value: A)(using workflowCtx: WorkflowContext): Unit =
-        workflowCtx.getSignalStore.setSignalValue(this, value)*/
     }
   }
 }

@@ -3,6 +3,7 @@
 
 # Local tooling metadata
 .bloop/
+.claude/
 .metals/
 .vscode/
 project/.bloop/

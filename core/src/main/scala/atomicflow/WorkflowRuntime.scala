@@ -11,34 +11,37 @@ trait WorkflowRuntime {
   def generateStepIdempotencyId: StepIdempotencyId
 
   @throws[WorkflowError.InputConflict]
-  def createWorkflowInstance[In, Out](
-                                       workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                       in: In
-                                     )(
-                                       using Cacheable[In]
-                                     ): Unit
+  def createWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    in: In,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Unit
 
   /**
    * - Must lock the workflow while running
    */
   @throws[WorkflowError.InputConflict]
-  def runWorkflowInstance[In, Out](
-                                    workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                    in: In
-                                  )(
-                                    using Cacheable[In]
-                                  ): Out
+  def runWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    in: In,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Out
 
   /**
    * - Must lock the workflow while running
    * - Must throw a WorkflowError.NotFound
    */
   @throws[WorkflowError.NotFound]
-  def recoverWorkflowInstance[In, Out](
-                                        workflowInstance: WorkflowInstanceBuilder[In, Out]
-                                      )(
-                                        using Cacheable[In]
-                                      ): Out
+  def recoverWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Out
 
   @throws[WorkflowError.NotFound]
   @throws[WorkflowError.SignalConflict]

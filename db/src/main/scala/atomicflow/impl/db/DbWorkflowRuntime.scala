@@ -25,19 +25,19 @@ import scala.concurrent.duration.FiniteDuration
 
 class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
-  override def createWorkflowInstance[In, Out](
-                                                workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                                in: In
-                                              )(
-                                                using Cacheable[In]
-                                              ): Unit = {
-    val id = workflowInstance.instanceId
-    val workflowId = workflowInstance.workflow.meta.id
-    val workflowMeta = workflowInstance.workflow.meta
+  override def createWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    in: In,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Unit = {
+    val workflowId = workflow.meta.id
+    val workflowMeta = workflow.meta
     val input = Cacheable[In].serialize(in).asInstanceOf[Array[Byte]]
 
     runSync {
-      sql"SELECT input FROM workflow_instance WHERE id = $id"
+      sql"SELECT input FROM workflow_instance WHERE id = $instanceId"
         .query[Array[Byte]]
         .option
         .flatMap {
@@ -47,11 +47,11 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
           case Some(_) =>
             throw WorkflowError.InputConflict(
               workflowMeta,
-              id
+              instanceId
             )
 
           case None =>
-            sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($id, $workflowId, $input)"
+            sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($instanceId, $workflowId, $input)"
               .update
               .run
               .void
@@ -59,88 +59,90 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  override def runWorkflowInstance[In, Out](
-                                             workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                             in: In
-                                           )(
-                                             using Cacheable[In]
-                                           ): Out = {
-    createWorkflowInstance(workflowInstance, in)
-    recoverWorkflowInstance(workflowInstance)
+  override def runWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    in: In,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Out = {
+    createWorkflowInstance(workflow, instanceId, in, defaultCacheTtl, stepIdempotencyIdOverrides)
+    recoverWorkflowInstance(workflow, instanceId, defaultCacheTtl, stepIdempotencyIdOverrides)
   }
 
-  override def recoverWorkflowInstance[In, Out](
-                                                 workflowInstance: WorkflowInstanceBuilder[In, Out]
-                                               )(
-                                                 using Cacheable[In]
-                                               ): Out = {
-    val id = workflowInstance.instanceId
-
+  override def recoverWorkflowInstance[In: Cacheable, Out](
+    workflow: Workflow[In, Out],
+    instanceId: WorkflowInstanceId,
+    defaultCacheTtl: FiniteDuration,
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+  ): Out = {
     val lockDuration = java.time.Duration.ofMinutes(5)
     val now = Instant.now()
     val lockUntil = now.plus(lockDuration)
-    val workflowMeta = workflowInstance.workflow.meta
+    val workflowMeta = workflow.meta
 
     runSync {
-      sql"SELECT id, locked_until FROM workflow_instance where id = $id"
+      sql"SELECT id, locked_until FROM workflow_instance where id = $instanceId"
         .query[(WorkflowInstanceId, Option[Instant])]
         .option
         .flatMap {
           case None =>
             throw WorkflowError.NotFound(
               workflowMeta,
-              id
+              instanceId
             )
 
           case Some((_, Some(lockedUntil))) if now.isBefore(lockedUntil) =>
             throw WorkflowError.Locked(
               workflowMeta,
-              id
+              instanceId
             )
 
           case Some((_, _)) =>
-            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id"
+            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $instanceId"
               .update
               .run
               .void
         }
     }
 
+    val _instanceId = instanceId
+    val _defaultCacheTtl = defaultCacheTtl
     val ctx = new atomicflow.WorkflowContext {
-      override val meta: WorkflowMeta = workflowInstance.workflow.meta
+      override val meta: WorkflowMeta = workflowMeta
 
-      override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
+      override val instanceId: WorkflowInstanceId = _instanceId
 
       override protected[atomicflow] def getFingerprinter: Fingerprinter =
         atomicflow.impl.Sha256Fingerprinter
 
-      override protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore.Bound =
-        new DbStepIdempotencyStore(stepScope, workflowInstance.stepIdempotencyIdOverrides)
+      override protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore =
+        new DbStepIdempotencyStore(stepScope, stepIdempotencyIdOverrides)
 
-      override protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache.Bound[StepOut] =
+      override protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache[StepOut] =
         new DbStepCache[StepOut](stepScope)
 
-      override protected[atomicflow] def getSignalStore: SignalStore.Bound =
+      override protected[atomicflow] def getSignalStore: SignalStore =
         DbSignalStore.bind(workflowScope)
 
       override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
-        workflowInstance.defaultCacheTtl
+        _defaultCacheTtl
     }
 
     try {
-      val inputBytes = runSync(loadInput(id)).getOrElse {
+      val inputBytes = runSync(loadInput(instanceId)).getOrElse {
         throw WorkflowError.NotFound(
           workflowMeta,
-          id
+          instanceId
         )
       }
-      workflowInstance.workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
+      workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
     } finally {
       val unlock =
         sql"""
         UPDATE workflow_instance
         SET locked_until = NULL
-        WHERE id = $id
+        WHERE id = $instanceId
       """.update.run
       runSync(unlock)
     }
@@ -152,7 +154,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
   class DbStepIdempotencyStore(
                                 stepScope: StepScope,
                                 stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
-                              ) extends StepIdempotencyStore.Bound {
+                              ) extends StepIdempotencyStore {
     override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
       val idQuery = sql"""
         SELECT id FROM step_idempotency
@@ -230,7 +232,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  class DbStepCache[Out: Cacheable](stepScope: StepScope) extends StepCache.Bound[Out] {
+  class DbStepCache[Out: Cacheable](stepScope: StepScope) extends StepCache[Out] {
     override def get(
                       stepIdempotencyId: StepIdempotencyId,
                       inputFingerprints: StepInputFingerprints
@@ -284,7 +286,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  object DbSignalStore extends SignalStore {
+  object DbSignalStore {
 
     // TODO: check expiry
     private def select[A](workflowScope: WorkflowScope, signal: Signal[A]): ConnectionIO[Option[Array[Byte]]] =
@@ -293,7 +295,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       WHERE id=${signal.meta.id} AND workflow_id=${workflowScope.workflowMeta.id} AND workflow_instance_id=${workflowScope.workflowInstanceId}
       """.query[Array[Byte]].option
 
-    override def bind(workflowScope: WorkflowScope): SignalStore.Bound = new SignalStore.Bound {
+    def bind(workflowScope: WorkflowScope): SignalStore = new SignalStore {
       override def getSignalValue[A](signal: Signal[A]): Option[A] =
         runSync {
           select(workflowScope, signal)
