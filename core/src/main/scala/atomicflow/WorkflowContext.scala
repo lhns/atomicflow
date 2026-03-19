@@ -14,6 +14,8 @@ trait WorkflowContext {
 
   def instanceId: WorkflowInstanceId
 
+  protected[atomicflow] def runtime: WorkflowRuntime
+
   override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceId"
 
   protected[atomicflow] def getFingerprinter: Fingerprinter
@@ -21,15 +23,11 @@ trait WorkflowContext {
   protected[atomicflow] final def workflowScope: WorkflowScope =
     WorkflowScope(meta, instanceId)
 
-  protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore.Bound
+  protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore
 
-  protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache.Bound[StepOut]
+  protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache[StepOut]
 
-  protected[atomicflow] def getSignalStore: SignalStore.Bound
+  protected[atomicflow] def getSignalStore: SignalStore
 
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
-}
-
-object WorkflowContext {
-  given (using stepCtx: StepContext[?]): WorkflowContext = stepCtx.workflowCtx
 }

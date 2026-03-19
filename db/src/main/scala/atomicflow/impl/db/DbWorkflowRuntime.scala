@@ -113,6 +113,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 
       override val instanceId: WorkflowInstanceId = _instanceId
 
+      override protected[atomicflow] def runtime: WorkflowRuntime = DbWorkflowRuntime.this
+
       override protected[atomicflow] def getFingerprinter: Fingerprinter =
         atomicflow.impl.Sha256Fingerprinter
 

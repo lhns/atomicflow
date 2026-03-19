@@ -19,7 +19,7 @@ object Test3 {
 
   def sendFile(bytes: Array[Byte], receiver: String): Unit = ()
 
-  val flow1: Workflow[String, Unit] = Workflow(WorkflowId("99a2866c-99c5-49b7-b0f5-ad097a3e3a78"), name = "read and send files") { (fileName: String) =>
+  val flow1: Workflow[String, Unit] = Workflow["99a2866c-99c5-49b7-b0f5-ad097a3e3a78"]("read and send files")[String, Unit] { (fileName: String) =>
     val fileBytes: Array[Byte] = Step.cached["533dddc7-d355-43b4-81d8-bd8051808ec5", 0](
       "fileName" -> fileName,
       "random" -> Random.nextInt()

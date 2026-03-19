@@ -167,6 +167,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override val instanceId: WorkflowInstanceId = _instanceId
 
+              override protected[atomicflow] def runtime: WorkflowRuntime = InMemoryWorkflowRuntime.this
+
               override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
               override protected[atomicflow] def getStepIdempotencyStore(stepScope: StepScope): StepIdempotencyStore =

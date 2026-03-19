@@ -77,6 +77,10 @@ object Fingerprintable {
     def fingerprintRep(value: Int, fp: Fingerprinter): fp.Rep =
       fp.longRep(value.toLong)
 
+  given Fingerprintable[Boolean] with
+    def fingerprintRep(value: Boolean, fp: Fingerprinter): fp.Rep =
+      fp.longRep(if value then 1L else 0L)
+
   given Fingerprintable[Float] with
     def fingerprintRep(value: Float, fp: Fingerprinter): fp.Rep =
       fp.doubleRep(value.toDouble)
