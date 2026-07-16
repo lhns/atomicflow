@@ -6,6 +6,7 @@ import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToAwaitManyCo
 
 import java.time.{Clock, Instant}
 import java.util.UUID
+import scala.concurrent.duration.FiniteDuration
 import scala.util.control.ControlThrowable
 
 case class Workflow[In: Cacheable, Out] private(
@@ -15,13 +16,16 @@ case class Workflow[In: Cacheable, Out] private(
   final def create(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, c: Cacheable[In]): Unit =
     rt.createWorkflowInstance(this, instanceId, in)
 
-  final def createAndRun(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
+  final def createAndRun(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, cIn: Cacheable[In], cOut: Cacheable[Out], s: WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out] =
     rt.createAndRunWorkflowInstance(this, instanceId, in)
 
-  final def run(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
+  final def run(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, cIn: Cacheable[In], cOut: Cacheable[Out], s: WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out] =
     rt.runWorkflowInstance(this, instanceId)
+
+  final def setSignal[A](instanceId: WorkflowInstanceKey, signal: Signal[A], value: A, ttl: FiniteDuration)(using rt: WorkflowRuntime): Unit =
+    rt.setSignal(signal, value, ttl)(using WorkflowInstanceMeta(instanceId, meta))
 }
 
 object Workflow {
@@ -76,7 +80,7 @@ object Workflow {
     }
 
   @throws[WorkflowNotFoundException]
-  def stopAndAwaitWorkflow[Out](awaitedWorkflow: Workflow[?, Out], awaitedInstanceKey: WorkflowInstanceKey)(using ctx: WorkflowContext): Nothing | Out = {
+  def stopAndAwaitWorkflow[Out](awaitedWorkflow: Workflow[?, Out], awaitedInstanceKey: WorkflowInstanceKey)(using ctx: WorkflowContext, cacheable: Cacheable[Out]): Nothing | Out = {
     ctx.workflowRuntime.getWorkflowResult[Out](awaitedWorkflow, awaitedInstanceKey) match {
       case Some(value) => value
       case None => throw WorkflowRuntime.WorkflowStoppedToAwaitWorkflow(awaitedWorkflow.meta.workflowId, awaitedInstanceKey)
