@@ -37,6 +37,9 @@ object Fingerprintable {
       ) => true
       case _ => false
     }
+
+    override def hashCode: Int =
+      util.Arrays.hashCode(bytes.asInstanceOf[Array[Byte]])
   }
 
   object Fingerprint {

@@ -31,6 +31,7 @@ object Signal {
                                 description: String | Unit = (),
                                 ttl: FiniteDuration = Constants.defaultSignalTtl
                               ): Signal[A] = {
+    val signalTtl = ttl
     new Signal[A] {
       override val meta: SignalMeta = SignalMeta(
         id = id,
@@ -44,7 +45,7 @@ object Signal {
         }
       )
 
-      override val ttl: FiniteDuration = ttl
+      override val ttl: FiniteDuration = signalTtl
 
       override def cacheable: Cacheable[A] = A
 

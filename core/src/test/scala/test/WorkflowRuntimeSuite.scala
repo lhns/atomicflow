@@ -1,6 +1,7 @@
 package test
 
 import atomicflow.WorkflowRuntime
+import cats.syntax.all.*
 import munit.*
 import atomicflow.{*, given}
 import Cacheable.Simple.given
@@ -324,5 +325,222 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val result = workflow.recoverUntilComplete(instanceId, pollInterval = 100.millis)
     assertEquals(result, "hello")
     thread.join()
+  }
+
+  test("Awaiting step should initiate once and complete when its signal is set") {
+    val initiations = AtomicInteger(0)
+    val signal = Signal[String](SignalId("38b7efd2-b590-4891-b7c0-f057beb46488"))
+
+    val workflow = Workflow["b3dce6e1-9d05-442c-ab16-bc40da457a4d"]("awaiting workflow")[Unit, String] { _ =>
+      Step.awaiting["497c1d09-277a-46fc-a17c-d044941436a2", 0](signal) {
+        initiations.incrementAndGet()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    intercept[WorkflowError.SignalEmpty] {
+      workflow.recover(instanceId)
+    }
+    intercept[WorkflowError.SignalEmpty] {
+      workflow.recover(instanceId)
+    }
+    assertEquals(initiations.get(), 1)
+
+    workflow.setSignal(instanceId, signal, "ok")
+
+    assertEquals(workflow.recover(instanceId), "ok")
+    assertEquals(workflow.recover(instanceId), "ok")
+    assertEquals(initiations.get(), 1)
+  }
+
+  test("Business-keyed instances should be stable per key") {
+    val counter = AtomicInteger(0)
+
+    val workflow = Workflow["776c5159-93be-4605-b31e-2a0f67286cae"]("keyed workflow")[String, Int] { (in: String) =>
+      Step.cached["eb58c561-a5f3-4c02-a2e6-551d67bd50b3", 0]("in" -> in) {
+        counter.incrementAndGet()
+      }
+    }
+
+    assertEquals(workflow.keyedInstanceId("k1"), workflow.keyedInstanceId("k1"))
+    assertNotEquals(workflow.keyedInstanceId("k1"), workflow.keyedInstanceId("k2"))
+
+    assertEquals(workflow.runKeyed("k1", "a"), 1)
+    assertEquals(workflow.runKeyed("k1", "a"), 1)
+    assertEquals(counter.get(), 1)
+
+    intercept[WorkflowError.InputConflict] {
+      workflow.runKeyed("k1", "b")
+    }
+
+    assertEquals(workflow.runKeyed("k2", "a"), 2)
+  }
+
+  test("childInstanceId should address a child instance for external signals") {
+    val signal = Signal[String](SignalId("c43913ce-0df7-4b8b-a3e0-6a795bde2e14"))
+
+    val childWorkflow = Workflow["6807c449-3417-40bf-b43d-7c086ebf89dc"]("awaiting child")[Unit, String] { _ =>
+      signal.value
+    }
+
+    val workflow = Workflow["62474e3f-e23f-4235-91f8-7d38e717227d"]("parent of awaiting child")[Unit, String] { _ =>
+      childWorkflow.runChild("d")
+    }
+
+    val parentId = WorkflowInstanceId.generate
+
+    intercept[WorkflowError.SignalEmpty] {
+      workflow.run(parentId)
+    }
+
+    childWorkflow.setSignal(childWorkflow.childInstanceId(parentId, "d"), signal, "done")
+
+    assertEquals(workflow.recover(parentId), "done")
+  }
+
+  test("File validation: per-file children, awaiting validation, correction-keyed retries") {
+    val listCalls = AtomicInteger(0)
+    val downloads = AtomicInteger(0)
+    val validationRequests = AtomicInteger(0)
+    val correctionRequests = AtomicInteger(0)
+    val successResponses = AtomicInteger(0)
+
+    object service {
+      def listFiles(): Seq[String] = {
+        listCalls.incrementAndGet()
+        Seq("f1", "f2", "f3")
+      }
+
+      def download(fileId: String, revision: String): String = {
+        downloads.incrementAndGet()
+        s"data:$fileId:$revision"
+      }
+
+      def requestValidation(fileId: String, revision: String, data: String): Unit =
+        validationRequests.incrementAndGet()
+
+      def requestCorrection(fileId: String, revision: String): Unit =
+        correctionRequests.incrementAndGet()
+
+      def respondSuccess(fileId: String): Unit =
+        successResponses.incrementAndGet()
+    }
+
+    val verdictSignal = Signal[String](SignalId("74c372bf-1169-4bb3-8a5b-144193aee35e")) // "valid" | "invalid"
+    val correctionSignal = Signal[String](SignalId("0e7c3d24-25b2-4e42-9e94-21f54feb891d")) // corrected revision id
+
+    case class AttemptIn(fileId: String, revision: String)
+    given Cacheable[AttemptIn] =
+      Cacheable[Seq[String]].imap(s => AttemptIn(s(0), s(1)))(a => Seq(a.fileId, a.revision))
+
+    // One validation attempt for a specific file revision.
+    // Returns Some(correctedRevision) on an invalid verdict, None once valid.
+    val attemptWorkflow = Workflow["f5082b97-f0c8-455e-b219-86ec537089ac"]("validation attempt")[AttemptIn, Option[String]] { (in: AttemptIn) =>
+      val data = Step.cached["95d643f5-fe27-4268-90c6-0cb8b38cb2c5", 0]("file" -> in.fileId, "revision" -> in.revision) {
+        service.download(in.fileId, in.revision)
+      }
+
+      val verdict = Step.awaiting["d2250f1a-6e0f-4fba-86dd-9264016c0adb", 0](verdictSignal, "revision" -> in.revision) {
+        service.requestValidation(in.fileId, in.revision, data)
+      }
+
+      if (verdict == "valid")
+        None
+      else
+        Some(
+          Step.awaiting["1cd844ee-b681-4723-a786-adea3dbcc1bf", 0](correctionSignal, "revision" -> in.revision) {
+            service.requestCorrection(in.fileId, in.revision)
+          }
+        )
+    }
+
+    // Retry loop keyed by domain identity: the corrected revision id keys the next attempt.
+    val fileWorkflow = Workflow["84425d32-231f-4356-88e8-d48e10977ba0"]("process file")[String, Unit] { (fileId: String) =>
+      var revision = "r0"
+      var corrected = attemptWorkflow.runChild(revision, AttemptIn(fileId, revision))
+      while (corrected.isDefined) {
+        revision = corrected.get
+        corrected = attemptWorkflow.runChild(revision, AttemptIn(fileId, revision))
+      }
+      Step.onlyOnce["81852774-5e57-4f25-beba-f8f9301fa5b0", 0]("file" -> fileId) {
+        service.respondSuccess(fileId)
+      }
+    }
+
+    val allFilesWorkflow = Workflow["7f9713b8-2a43-4a34-9d57-a7182dc31712"]("all files")[Unit, Unit] { _ =>
+      val files = Step.cached["805526f9-e9d7-4f3e-a297-5ad693068598", 0]() {
+        service.listFiles()
+      }
+      val pendings = files.flatMap { fileId =>
+        Workflow.orPending(fileWorkflow.runChild(fileId, fileId)).left.toOption
+      }
+      pendings.headOption.foreach(e => throw e)
+    }
+
+    def counters =
+      (listCalls.get(), downloads.get(), validationRequests.get(), correctionRequests.get(), successResponses.get())
+
+    val scanKey = "scan-2026-08-03"
+    val rootId = allFilesWorkflow.keyedInstanceId(scanKey)
+
+    // External actors address an attempt knowing only root id, file id and revision.
+    def attemptInstance(fileId: String, revision: String): WorkflowInstanceId =
+      attemptWorkflow.childInstanceId(fileWorkflow.childInstanceId(rootId, fileId), revision)
+
+    // Pass 1: all three files download and request validation, everything pending
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.runKeyed(scanKey)
+    }
+    assertEquals(counters, (1, 3, 3, 0, 0))
+
+    // Replay without news: no side effect runs again
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.recover(rootId)
+    }
+    assertEquals(counters, (1, 3, 3, 0, 0))
+
+    // f1 is valid — completes even though f2/f3 are still pending
+    attemptWorkflow.setSignal(attemptInstance("f1", "r0"), verdictSignal, "valid")
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.recover(rootId)
+    }
+    assertEquals(counters, (1, 3, 3, 0, 1))
+
+    // f2 is invalid — a correction is requested
+    attemptWorkflow.setSignal(attemptInstance("f2", "r0"), verdictSignal, "invalid")
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.recover(rootId)
+    }
+    assertEquals(counters, (1, 3, 3, 1, 1))
+
+    // Verdicts are write-once per attempt
+    intercept[WorkflowError.SignalConflict] {
+      attemptWorkflow.setSignal(attemptInstance("f2", "r0"), verdictSignal, "valid")
+    }
+
+    // The corrected revision r1 arrives and keys a fresh attempt: re-download, re-validate
+    attemptWorkflow.setSignal(attemptInstance("f2", "r0"), correctionSignal, "r1")
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.recover(rootId)
+    }
+    assertEquals(counters, (1, 4, 4, 1, 1))
+
+    // The fresh attempt has a fresh write-once slot for its verdict
+    attemptWorkflow.setSignal(attemptInstance("f2", "r1"), verdictSignal, "valid")
+    intercept[WorkflowError.SignalEmpty] {
+      allFilesWorkflow.recover(rootId)
+    }
+    assertEquals(counters, (1, 4, 4, 1, 2))
+
+    // f3 is valid — the whole scan completes
+    attemptWorkflow.setSignal(attemptInstance("f3", "r0"), verdictSignal, "valid")
+    allFilesWorkflow.recover(rootId)
+    assertEquals(counters, (1, 4, 4, 1, 3))
+
+    // Replay after completion changes nothing
+    allFilesWorkflow.recover(rootId)
+    assertEquals(counters, (1, 4, 4, 1, 3))
   }
 }

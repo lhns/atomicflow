@@ -54,22 +54,42 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
                   )(using rt: WorkflowRuntime): Unit =
     rt.setSignal(signal, value, signal.ttl, meta, instanceId)
 
+  /** The instance ID `runChild(discriminator, _)` uses under the given parent instance.
+    * External actors use this to target signals of a child instance. */
+  def childInstanceId(parentInstanceId: WorkflowInstanceId, discriminator: String): WorkflowInstanceId =
+    WorkflowInstanceId.deriveChild(parentInstanceId, meta.id, discriminator)
+
+  /** The instance ID `runKeyed(businessKey, _)` uses. */
+  def keyedInstanceId(businessKey: String): WorkflowInstanceId =
+    WorkflowInstanceId.deriveKeyed(meta.id, businessKey)
+
   def runChild(
     discriminator: String,
     in: In
-  )(using ctx: WorkflowContext): Out = {
-    val childId = WorkflowInstanceId.unsafeMake(
-      java.util.UUID.nameUUIDFromBytes(
-        s"${ctx.instanceId.value}/${meta.id.value}/$discriminator".getBytes("UTF-8")
-      ).toString
-    )
-    run(childId, in)(using ctx.runtime)
-  }
+  )(using ctx: WorkflowContext): Out =
+    run(childInstanceId(ctx.instanceId, discriminator), in)(using ctx.runtime)
 
   inline def runChild(
     discriminator: String
   )(using WorkflowContext, Unit =:= In): Out =
     runChild(discriminator, ())
+
+  /** Runs a top-level instance whose ID is derived from a business key:
+    * the same key always addresses the same instance. */
+  @throws[WorkflowError.InputConflict]
+  def runKeyed(
+                businessKey: String,
+                in: In,
+                cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
+                stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+              )(using rt: WorkflowRuntime): Out =
+    run(keyedInstanceId(businessKey), in, cacheTtl, stepIdempotencyIdOverrides)
+
+  @throws[WorkflowError.InputConflict]
+  inline def runKeyed(
+                businessKey: String
+              )(using WorkflowRuntime, Unit =:= In): Out =
+    runKeyed(businessKey, ())
 
   @throws[WorkflowError.NotFound]
   def recoverUntilComplete(
@@ -114,4 +134,12 @@ object Workflow {
 
   inline def sub[UUID <: String & Singleton]: SubWorkflowBuilder =
     new SubWorkflowBuilder(WorkflowId(constValue[UUID]))
+
+  /** Runs `body`; a pending abort (a [[WorkflowError.SignalEmpty]] from the subtree —
+    * typically a child run awaiting a signal) becomes a `Left` instead of propagating,
+    * so sibling work can proceed. Rethrow a collected `Left` at the end of the parent
+    * body to keep the parent itself pending. */
+  def orPending[A](body: => A): Either[WorkflowError.SignalEmpty, A] =
+    try Right(body)
+    catch case e: WorkflowError.SignalEmpty => Left(e)
 }

@@ -14,6 +14,9 @@ object Step {
 
   inline def onlyOnce[UUID <: String & Singleton, V <: Int & Singleton]: OnlyOnceStepBuilder =
     new OnlyOnceStepBuilder(StepId(constValue[UUID]), constValue[V].toLong)
+
+  inline def awaiting[UUID <: String & Singleton, V <: Int & Singleton]: AwaitingStepBuilder =
+    new AwaitingStepBuilder(StepId(constValue[UUID]), constValue[V].toLong)
 }
 
 /** Pure step builder. The id/version are captured for uniform syntax with cached/onlyOnce
@@ -69,5 +72,25 @@ class OnlyOnceStepBuilder(id: StepId, version: Long) {
         cache.put(idempotencyId, inputFingerprints, result, wfCtx.defaultCacheTtl)
         result
     }
+  }
+}
+
+/** Awaiting step: runs `initiate` exactly once (like [[Step.onlyOnce]]), then reads `signal`.
+  * If the signal is unset, throws [[WorkflowError.SignalEmpty]] — the run aborts pending and
+  * a later `recover()` resumes it. Once the signal is observed, its value is captured in the
+  * step cache so completed replays no longer depend on the signal row. */
+class AwaitingStepBuilder(id: StepId, version: Long) {
+  private val captureStepId: StepId = StepId.unsafeMake(
+    java.util.UUID.nameUUIDFromBytes(s"${StepId.unwrap(id)}/awaiting".getBytes("UTF-8")).toString
+  )
+
+  @throws[WorkflowError.SignalEmpty]
+  def apply[A](signal: Signal[A], inputs: StepInput[?]*)(initiate: => Unit)(using wfCtx: WorkflowContext): A = {
+    locally {
+      import Cacheable.Simple.given
+      new OnlyOnceStepBuilder(id, version).apply[Unit](inputs*) { initiate }
+    }
+    given Cacheable[A] = signal.cacheable
+    new CachedStepBuilder(captureStepId, version).apply[A](inputs*) { signal.value }
   }
 }

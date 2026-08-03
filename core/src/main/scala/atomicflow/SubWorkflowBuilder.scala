@@ -8,11 +8,10 @@ class SubWorkflowBuilder(id: WorkflowId) {
       meta = WorkflowMeta(id = id, name = discriminator, description = None),
       body = (ctx, _) => body(using ctx)
     )
-    val childId = WorkflowInstanceId.unsafeMake(
-      java.util.UUID.nameUUIDFromBytes(
-        s"${parentCtx.instanceId.value}/${id.value}/$discriminator".getBytes("UTF-8")
-      ).toString
-    )
-    childWorkflow.run(childId, ())(using parentCtx.runtime)
+    childWorkflow.run(childInstanceId(parentCtx.instanceId, discriminator), ())(using parentCtx.runtime)
   }
+
+  /** The instance ID `apply(discriminator)` uses under the given parent instance. */
+  def childInstanceId(parentInstanceId: WorkflowInstanceId, discriminator: String): WorkflowInstanceId =
+    WorkflowInstanceId.deriveChild(parentInstanceId, id, discriminator)
 }

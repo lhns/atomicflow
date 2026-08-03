@@ -43,6 +43,8 @@ object Cacheable {
 
     given Cacheable[Float] = Cacheable[String].imap(_.toFloat)(_.toString)
 
+    given Cacheable[Boolean] = Cacheable[String].imap(_.toBoolean)(_.toString)
+
     given Cacheable[Unit] = new Cacheable[Unit] {
       override def serialize(value: Unit): IArray[Byte] = IArray.empty[Byte]
       override def deserialize(bytes: IArray[Byte]): Unit = ()
