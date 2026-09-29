@@ -226,12 +226,13 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   }
 
   private class WorkflowSignalStore {
-    val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceId, SignalId), ?]] = new AtomicReference(Map.empty)
+    // Stored serialized, like a persistent runtime would, so readers observe exactly what a replay observes.
+    val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceId, SignalId), IArray[Byte]]] = new AtomicReference(Map.empty)
 
     def bind(workflowScope: WorkflowScope): SignalStore = new SignalStore {
       override def getSignalValue[A](signal: Signal[A]): Option[A] = {
         val key = (workflowScope.workflowMeta.id, workflowScope.workflowInstanceId, signal.meta.id)
-        signalValues.get().get(key).asInstanceOf[Option[A]]
+        signalValues.get().get(key).map(signal.cacheable.deserialize)
       }
 
       override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
@@ -243,15 +244,16 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             workflowScope.workflowInstanceId
           )
 
+        val bytes = signal.cacheable.serialize(value)
         signalValues.updateAndGet { map =>
-          if (map.get(key).exists(_ != value))
+          if (map.get(key).exists(existing => !java.util.Arrays.equals(existing.asInstanceOf[Array[Byte]], bytes.asInstanceOf[Array[Byte]])))
             throw WorkflowError.SignalConflict(
               workflowScope.workflowMeta,
               workflowScope.workflowInstanceId,
               signal
             )
 
-          map + (key -> value)
+          map + (key -> bytes)
         }
       }
     }

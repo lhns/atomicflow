@@ -633,6 +633,21 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(parent.run(WorkflowInstanceId.generate, (), cacheTtl = 3.hours), (3L, 3L))
   }
 
+  test("A step's first run observes the value as a replay would (commit before observation)") {
+    // A lossy codec: only the trimmed value survives serialization
+    val trimming: Cacheable[String] = Cacheable[String].imap(_.trim)(identity)
+
+    val workflow = Workflow["7c3e9a5b-1d2f-4e6a-8b0c-2d4f6a8b0c01"]("lossy")[Unit, (String, String)] { _ =>
+      val cached = Step.cached["7c3e9a5b-1d2f-4e6a-8b0c-2d4f6a8b0c02", 0]()("  cached  ")(using trimming, summon[WorkflowContext])
+      val once = Step.onlyOnce["7c3e9a5b-1d2f-4e6a-8b0c-2d4f6a8b0c03"]()("  once  ")(using trimming, summon[WorkflowContext])
+      (cached, once)
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    assertEquals(workflow.run(instanceId), ("cached", "once"))
+    assertEquals(workflow.run(instanceId), ("cached", "once"))
+  }
+
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)

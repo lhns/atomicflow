@@ -41,6 +41,11 @@ private[atomicflow] def stepScope(id: StepId, version: Long)(using wfCtx: Workfl
     wfCtx.workflowScope
   )
 
+/** Commit before observation: a step's caller always observes the value as it comes back from the cache, so the
+  * first run and every replay see exactly the same value, even with a lossy [[Cacheable]]. */
+private[atomicflow] def observed[Out: Cacheable](value: Out): Out =
+  Cacheable[Out].deserialize(Cacheable[Out].serialize(value))
+
 private[atomicflow] def fingerprints(inputs: Seq[StepInput[?]])(using wfCtx: WorkflowContext): StepInputFingerprints = {
   val fingerprinter = wfCtx.getFingerprinter
   StepInputFingerprints(inputs.map(i => i.name -> i.fingerprint(fingerprinter)).toMap)
@@ -57,7 +62,7 @@ class CachedStepBuilder(id: StepId, version: Long) {
       case StepState.Completed(value) => value
       case StepState.NotStarted | StepState.Started =>
         wfCtx.checkpoint()
-        val result = body
+        val result = observed(body)
         cache.put(idempotencyId, inputFingerprints, result, wfCtx.defaultCacheTtl)
         result
     }
@@ -98,7 +103,7 @@ class OnlyOnceStepBuilder(id: StepId, shouldRetry: Throwable => Boolean) {
         wfCtx.checkpoint()
         cache.markStarted(idempotencyId, inputFingerprints)
         val result =
-          try body
+          try observed(body)
           catch {
             case e: PendingSignal =>
               // Awaiting a signal inside the body is not a side effect failure.
