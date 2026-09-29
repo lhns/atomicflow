@@ -58,7 +58,7 @@ object FileValidationExample {
         service.download(in.fileId, in.revision)
       }
 
-      val verdict = Step.awaiting["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0305", 0](verdictSignal, "revision" -> in.revision) {
+      val verdict = Step.awaiting["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0305"](verdictSignal, "revision" -> in.revision) {
         service.requestValidation(in.fileId, in.revision, data)
       }
 
@@ -66,7 +66,7 @@ object FileValidationExample {
         None
       else
         Some(
-          Step.awaiting["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0306", 0](correctionSignal, "revision" -> in.revision) {
+          Step.awaiting["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0306"](correctionSignal, "revision" -> in.revision) {
             service.requestCorrection(in.fileId, in.revision)
           }
         )
@@ -81,7 +81,7 @@ object FileValidationExample {
         revision = corrected.get
         corrected = attemptWorkflow.runChild(revision, AttemptIn(fileId, revision))
       }
-      Step.onlyOnce["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0308", 0]("file" -> fileId) {
+      Step.onlyOnce["41b8a71d-53dc-4a5c-9d5d-3d0f5b1f0308"]("file" -> fileId) {
         service.respondSuccess(fileId)
       }
     }

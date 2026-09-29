@@ -52,6 +52,17 @@ object WorkflowError {
     s"Cannot re-run step with different input: ${WorkflowErrorMessages.stepRef(stepMeta)}"
   ) with WorkflowError
 
+  /** An at-most-once step was started but never recorded an outcome, so its side effect may or may not have happened.
+    * The workflow cannot continue automatically: check the external system, then either override the step's idempotency
+    * id (`stepIdempotencyIdOverrides`) to run it again, or change the workflow to skip it. */
+  final case class StepUnknownState(
+                                     workflowMeta: WorkflowMeta,
+                                     workflowInstanceId: WorkflowInstanceId,
+                                     stepMeta: StepMeta
+                                   ) extends Exception(
+    s"Step was started but its outcome is unknown: ${WorkflowErrorMessages.stepRef(stepMeta)}"
+  ) with WorkflowError
+
   /** The workflow is pending: it awaits a signal that is not set yet. Resume it with `recover()` once it is set.
     *
     * This is what callers of `run`/`create`/`recover` observe. Inside workflow bodies, pending travels as the internal

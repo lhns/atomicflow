@@ -164,7 +164,7 @@ mechanics:
 val verdict = Signal[String](SignalId("74c372bf-1169-4bb3-8a5b-144193aee35e"))
 
 val reviewed = Workflow["b3dce6e1-9d05-442c-ab16-bc40da457a4d"]("reviewed")[String, String] { (document: String) =>
-  Step.awaiting["497c1d09-277a-46fc-a17c-d044941436a2", 0](verdict, "document" -> document) {
+  Step.awaiting["497c1d09-277a-46fc-a17c-d044941436a2"](verdict, "document" -> document) {
     // runs exactly once, even across recoveries
     requestManualReview(document)
   }

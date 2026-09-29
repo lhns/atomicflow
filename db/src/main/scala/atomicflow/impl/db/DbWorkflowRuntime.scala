@@ -5,7 +5,7 @@ import atomicflow.Constants.libraryVersion
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.db.CirceCodecs.given
 import atomicflow.impl.db.DbWorkflowRuntime.given
-import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, WorkflowScope}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, StepState, WorkflowScope}
 import cats.Monad
 import cats.effect.std.Dispatcher
 import cats.effect.{Async, IO, Resource}
@@ -246,21 +246,51 @@ class DbWorkflowRuntime[F[_] : Async](
   }
 
   class DbStepCache[Out: Cacheable](stepScope: StepScope, lockToken: UUID) extends StepCache[Out] {
+    private val instanceId = stepScope.workflowExecutionScope.workflowInstanceId
+
+    private def lockedError: WorkflowError.Locked =
+      WorkflowError.Locked(stepScope.workflowExecutionScope.workflowMeta, instanceId)
+
+    private def selectExisting(stepIdempotencyId: StepIdempotencyId): ConnectionIO[Option[(Option[Array[Byte]], Long, StepInputFingerprints)]] =
+      sql"""
+        SELECT output, step_version, input_fingerprints FROM step_cache
+        WHERE step_idempotency_id = ${stepIdempotencyId} and step_id = ${stepScope.stepMeta.id}
+      """.query[(Option[Array[Byte]], Long, StepInputFingerprints)].option
+
+    private def matches(version: Long, fingerprints: StepInputFingerprints, inputFingerprints: StepInputFingerprints): Boolean =
+      version == stepScope.stepMeta.version && fingerprints == inputFingerprints
+
     override def get(
                       stepIdempotencyId: StepIdempotencyId,
                       inputFingerprints: StepInputFingerprints
-                    ): Option[Out] = {
-      val query = sql"""
-        SELECT output, step_version, input_fingerprints FROM step_cache
-        WHERE step_idempotency_id = ${stepIdempotencyId} and step_id = ${stepScope.stepMeta.id}
-      """.query[(Array[Byte], Long, StepInputFingerprints)].option
-
-      runSync(query).flatMap {
-        case (data, version, fingerprints) if version == stepScope.stepMeta.version && fingerprints == inputFingerprints =>
-          Some(Cacheable[Out].deserialize(data.asInstanceOf[IArray[Byte]]))
-        case _ => throw stepScope.stepConflictError()
+                    ): StepState[Out] =
+      runSync(selectExisting(stepIdempotencyId)) match {
+        case None => StepState.NotStarted
+        case Some((output, version, fingerprints)) if matches(version, fingerprints, inputFingerprints) =>
+          output.fold(StepState.Started)(data => StepState.Completed(Cacheable[Out].deserialize(data.asInstanceOf[IArray[Byte]])))
+        case Some(_) => throw stepScope.stepConflictError()
       }
-    }
+
+    override def markStarted(
+                              stepIdempotencyId: StepIdempotencyId,
+                              inputFingerprints: StepInputFingerprints
+                            ): Unit =
+      runSync {
+        (sql"""
+        INSERT INTO step_cache (step_idempotency_id, step_id, step_version, input_fingerprints, output, expiry)
+        SELECT ${stepIdempotencyId}, ${stepScope.stepMeta.id}, ${stepScope.stepMeta.version}, $inputFingerprints, NULL, NULL
+        WHERE """ ++ ownsLock(instanceId, lockToken)).update.run
+      } match {
+        case 0 => throw lockedError
+        case _ => ()
+      }
+
+    override def clearStarted(stepIdempotencyId: StepIdempotencyId): Unit =
+      runSync {
+        (sql"""
+        DELETE FROM step_cache
+        WHERE step_idempotency_id = ${stepIdempotencyId} AND output IS NULL AND """ ++ ownsLock(instanceId, lockToken)).update.run
+      }
 
     override def put(
                       stepIdempotencyId: StepIdempotencyId,
@@ -271,35 +301,29 @@ class DbWorkflowRuntime[F[_] : Async](
       val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
       val data = Cacheable[Out].serialize(value).asInstanceOf[Array[Byte]]
 
-      val existingQuery =
-        sql"""
-        SELECT step_version, input_fingerprints FROM step_cache
-        WHERE step_idempotency_id = ${stepIdempotencyId} and step_id = ${stepScope.stepMeta.id}
-      """.query[(Long, StepInputFingerprints)].option
-
       val query =
         (sql"""
         INSERT INTO step_cache (step_idempotency_id, step_id, step_version, input_fingerprints, output, expiry)
         SELECT ${stepIdempotencyId}, ${stepScope.stepMeta.id}, ${stepScope.stepMeta.version}, $inputFingerprints, $data, $expiry
-        WHERE """ ++ ownsLock(stepScope.workflowExecutionScope.workflowInstanceId, lockToken) ++ fr"""
+        WHERE """ ++ ownsLock(instanceId, lockToken) ++ fr"""
         ON CONFLICT (step_idempotency_id) DO UPDATE
         SET step_version = ${stepScope.stepMeta.version},
             input_fingerprints = $inputFingerprints,
             output = $data,
             expiry = $expiry
-      """).update.run.map {
-          case 0 => throw WorkflowError.Locked(stepScope.workflowExecutionScope.workflowMeta, stepScope.workflowExecutionScope.workflowInstanceId)
-          case _ => ()
+      """).update.run
+
+      runSync {
+        selectExisting(stepIdempotencyId).flatMap {
+          case Some((_, version, fingerprints)) if !matches(version, fingerprints, inputFingerprints) =>
+            throw stepScope.stepConflictError()
+          case _ =>
+            query.map {
+              case 0 => throw lockedError
+              case _ => ()
+            }
         }
-
-      runSync(existingQuery).foreach {
-        case (existingVersion, existingFingerprints)
-          if existingVersion != stepScope.stepMeta.version || existingFingerprints != inputFingerprints =>
-          throw stepScope.stepConflictError()
-        case _ =>
       }
-
-      runSync(query)
     }
   }
 

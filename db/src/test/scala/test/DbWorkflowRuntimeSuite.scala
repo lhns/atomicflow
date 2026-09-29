@@ -151,4 +151,30 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     runner.join()
     assertEquals(result.get().get, 15)
   }
+
+  test("After a lost lock, an in-flight onlyOnce step is reported as unknown instead of running twice") {
+    given WorkflowRuntime = shortLockRuntime
+    val effects = AtomicInteger(0)
+
+    val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a06"]("lock takeover once")[Unit, Int] { _ =>
+      Step.onlyOnce["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a07"]() {
+        effects.incrementAndGet()
+        Thread.sleep(3000) // outlives the 2s lock
+        1
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    val resultA = AtomicReference[Try[Int]]()
+    val threadA = thread(resultA.set(Try(workflow.recover(instanceId))))
+    Thread.sleep(2300)
+    intercept[WorkflowError.StepUnknownState] {
+      workflow.recover(instanceId)
+    }
+    threadA.join()
+    assert(resultA.get().failed.toOption.exists(_.isInstanceOf[WorkflowError.Locked]), s"run A: ${resultA.get()}")
+    assertEquals(effects.get(), 1)
+  }
 }

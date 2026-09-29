@@ -124,7 +124,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val answer = AtomicInteger(42)
 
     val workflow = Workflow["72b29e07-46ad-4b95-b591-cea2a4dbffce"]("workflow with once steps")[String, Int] { (string: String) =>
-      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7"](
         "input" -> string
       ) {
         if (string == "answer")
@@ -151,7 +151,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
         answer.get()
       }
 
-      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7", 0](
+      Step.onlyOnce["d27142b9-e7db-4b8e-b341-6dd3009655c7"](
         "input" -> string,
         "a" -> a
       ) {
@@ -335,7 +335,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val signal = Signal[String](SignalId("38b7efd2-b590-4891-b7c0-f057beb46488"))
 
     val workflow = Workflow["b3dce6e1-9d05-442c-ab16-bc40da457a4d"]("awaiting workflow")[Unit, String] { _ =>
-      Step.awaiting["497c1d09-277a-46fc-a17c-d044941436a2", 0](signal) {
+      Step.awaiting["497c1d09-277a-46fc-a17c-d044941436a2"](signal) {
         initiations.incrementAndGet()
       }
     }
@@ -445,7 +445,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
         service.download(in.fileId, in.revision)
       }
 
-      val verdict = Step.awaiting["d2250f1a-6e0f-4fba-86dd-9264016c0adb", 0](verdictSignal, "revision" -> in.revision) {
+      val verdict = Step.awaiting["d2250f1a-6e0f-4fba-86dd-9264016c0adb"](verdictSignal, "revision" -> in.revision) {
         service.requestValidation(in.fileId, in.revision, data)
       }
 
@@ -453,7 +453,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
         None
       else
         Some(
-          Step.awaiting["1cd844ee-b681-4723-a786-adea3dbcc1bf", 0](correctionSignal, "revision" -> in.revision) {
+          Step.awaiting["1cd844ee-b681-4723-a786-adea3dbcc1bf"](correctionSignal, "revision" -> in.revision) {
             service.requestCorrection(in.fileId, in.revision)
           }
         )
@@ -467,7 +467,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
         revision = corrected.get
         corrected = attemptWorkflow.runChild(revision, AttemptIn(fileId, revision))
       }
-      Step.onlyOnce["81852774-5e57-4f25-beba-f8f9301fa5b0", 0]("file" -> fileId) {
+      Step.onlyOnce["81852774-5e57-4f25-beba-f8f9301fa5b0"]("file" -> fileId) {
         service.respondSuccess(fileId)
       }
     }
@@ -545,6 +545,76 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     // Replay after completion changes nothing
     allFilesWorkflow.recover(rootId)
     assertEquals(counters, (1, 4, 4, 1, 3))
+  }
+
+  test("onlyOnce retries a body that threw, by default") {
+    val attempts = AtomicInteger(0)
+
+    val workflow = Workflow["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a01"]("retryable once")[Unit, Int] { _ =>
+      Step.onlyOnce["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a02"]() {
+        if (attempts.incrementAndGet() == 1) throw new RuntimeException("transient")
+        attempts.get()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    intercept[RuntimeException] {
+      workflow.run(instanceId)
+    }
+    assertEquals(workflow.recover(instanceId), 2)
+    assertEquals(workflow.recover(instanceId), 2)
+    assertEquals(attempts.get(), 2)
+  }
+
+  test("A strict onlyOnce step whose body threw is in an unknown state until overridden") {
+    val attempts = AtomicInteger(0)
+
+    val workflow = Workflow["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a03"]("strict once")[Unit, Int] { _ =>
+      Step.onlyOnce["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a04"].strict() {
+        if (attempts.incrementAndGet() == 1) throw new RuntimeException("read timeout: did the request go through?")
+        attempts.get()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    intercept[RuntimeException] {
+      workflow.run(instanceId)
+    }
+    intercept[WorkflowError.StepUnknownState] {
+      workflow.recover(instanceId)
+    }
+    assertEquals(attempts.get(), 1)
+
+    // After checking the external system, an operator deliberately allows it to run again
+    assertEquals(
+      workflow.recover(
+        instanceId,
+        stepIdempotencyIdOverrides = Map(StepId("2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a04") -> StepIdempotencyId.generate)
+      ),
+      2
+    )
+    assertEquals(workflow.recover(instanceId), 2)
+    assertEquals(attempts.get(), 2)
+  }
+
+  test("onlyOnce retryIf classifies which exceptions mean the side effect did not happen") {
+    val attempts = AtomicInteger(0)
+
+    val workflow = Workflow["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a05"]("classified once")[Unit, Int] { _ =>
+      Step.onlyOnce["2e7c9d41-0b6a-4f3e-8c5d-9a1b3e5f7a06"].retryIf(_.isInstanceOf[java.net.ConnectException])() {
+        attempts.incrementAndGet() match {
+          case 1 => throw new java.net.ConnectException("refused: nothing was sent")
+          case 2 => throw new java.net.SocketTimeoutException("sent, but no answer")
+          case n => n
+        }
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    intercept[java.net.ConnectException](workflow.run(instanceId))
+    intercept[java.net.SocketTimeoutException](workflow.recover(instanceId))
+    intercept[WorkflowError.StepUnknownState](workflow.recover(instanceId))
+    assertEquals(attempts.get(), 2)
   }
 
   test("Concurrent runs of the same instance are mutually exclusive") {

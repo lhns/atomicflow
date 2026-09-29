@@ -28,7 +28,7 @@ object Test3 {
       readFile(fileName)
     }
 
-    val f: Path = Step.onlyOnce["f4a18269-83a8-4fcf-a62b-3cbb6216ddee", 0](
+    val f: Path = Step.onlyOnce["f4a18269-83a8-4fcf-a62b-3cbb6216ddee"](
       "fileBytes" -> fileBytes
     ) {
       println(s"sending file")

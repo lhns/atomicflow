@@ -3,7 +3,7 @@ package atomicflow.impl.memory
 import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, WorkflowScope}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, StepState, WorkflowScope}
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
@@ -51,31 +51,46 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   }
 
   class WorkflowStepCache {
+    /** Stored in place of a value while an at-most-once step's body runs. */
+    private object StartedMarker
+
     val stepCache: AtomicReference[Map[StepIdempotencyId, (StepId, Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
 
     def bind[StepOut](stepScope: StepScope): StepCache[StepOut] = new StepCache[StepOut] {
+      private val stepId = stepScope.stepMeta.id
+      private val stepVersion = stepScope.stepMeta.version
+
       override def get(
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints
-                      ): Option[StepOut] = {
-        val stepId = stepScope.stepMeta.id
-        val stepVersion = stepScope.stepMeta.version
-        stepCache.get().get(stepIdempotencyId).map {
-          case (`stepId`, `stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
-          case _ => throw stepScope.stepConflictError()
+                      ): StepState[StepOut] =
+        stepCache.get().get(stepIdempotencyId) match {
+          case None => StepState.NotStarted
+          case Some((`stepId`, `stepVersion`, `inputFingerprints`, StartedMarker)) => StepState.Started
+          case Some((`stepId`, `stepVersion`, `inputFingerprints`, out: StepOut @unchecked)) => StepState.Completed(out)
+          case Some(_) => throw stepScope.stepConflictError()
         }
-      }
 
+      override def markStarted(
+                                stepIdempotencyId: StepIdempotencyId,
+                                inputFingerprints: StepInputFingerprints
+                              ): Unit =
+        stepCache.updateAndGet(_ + (stepIdempotencyId -> (stepId, stepVersion, inputFingerprints, StartedMarker)))
+
+      override def clearStarted(stepIdempotencyId: StepIdempotencyId): Unit =
+        stepCache.updateAndGet { cache =>
+          cache.get(stepIdempotencyId) match {
+            case Some((_, _, _, StartedMarker)) => cache - stepIdempotencyId
+            case _ => cache
+          }
+        }
 
       override def put(
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints,
                         value: StepOut,
                         ttl: FiniteDuration
-                      ): Unit = {
-        val stepId = stepScope.stepMeta.id
-        val stepVersion = stepScope.stepMeta.version
-
+                      ): Unit =
         stepCache.updateAndGet { cache =>
           cache.get(stepIdempotencyId) match {
             case Some((existingStepId, existingStepVersion, existingFingerprints, _))
@@ -86,7 +101,6 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
               cache + (stepIdempotencyId -> (stepId, stepVersion, inputFingerprints, value))
           }
         }
-      }
     }
   }
 
