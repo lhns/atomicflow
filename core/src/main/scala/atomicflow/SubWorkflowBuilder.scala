@@ -8,8 +8,7 @@ class SubWorkflowBuilder(id: WorkflowId) {
       meta = WorkflowMeta(id = id, name = discriminator, description = None),
       body = (ctx, _) => body(using ctx)
     )
-    // Deliberately bypasses `run`: pending must keep travelling as a control throwable through the parent body.
-    parentCtx.runtime.runWorkflowInstance(childWorkflow, childInstanceId(parentCtx.instanceId, discriminator), (), Constants.defaultCacheTtl, Map.empty)
+    Workflow.runAsChild(childWorkflow, childInstanceId(parentCtx.instanceId, discriminator), ())(using summon[Cacheable[Unit]], parentCtx)
   }
 
   /** The instance ID `apply(discriminator)` uses under the given parent instance. */

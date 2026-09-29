@@ -37,7 +37,8 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
       instanceId: WorkflowInstanceId,
       in: In,
       defaultCacheTtl: FiniteDuration,
-      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+      parent: Option[WorkflowContext]
     ): Unit =
       unavailable
 
@@ -46,7 +47,8 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
       instanceId: WorkflowInstanceId,
       in: In,
       defaultCacheTtl: FiniteDuration,
-      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+      parent: Option[WorkflowContext]
     ): Out =
       unavailable
 
@@ -54,7 +56,8 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId,
       defaultCacheTtl: FiniteDuration,
-      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+      stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+      parent: Option[WorkflowContext]
     ): Out =
       unavailable
 
@@ -176,5 +179,38 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     threadA.join()
     assert(resultA.get().failed.toOption.exists(_.isInstanceOf[WorkflowError.Locked]), s"run A: ${resultA.get()}")
     assertEquals(effects.get(), 1)
+  }
+
+  test("A child running inline keeps its ancestors' locks alive") {
+    given WorkflowRuntime = shortLockRuntime
+
+    val child = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a08"]("long child")[Unit, Int] { _ =>
+      (1 to 5).map { i =>
+        Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a09", 0]("i" -> i) {
+          Thread.sleep(700)
+          i
+        }
+      }.sum
+    }
+
+    val parent = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a10"]("parent of long child")[Unit, Int] { _ =>
+      val result = child.runChild("c")
+      // A fenced parent write after the child: fails with Locked if the parent's lock was taken over meanwhile.
+      Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a11", 0]("result" -> result) {
+        result
+      }
+    }
+
+    val parentId = WorkflowInstanceId.generate
+    parent.create(parentId)
+
+    val result = AtomicReference[Try[Int]]()
+    val runner = thread(result.set(Try(parent.recover(parentId))))
+    Thread.sleep(2600) // past the parent's initial 2s lock, while the child is still running
+    intercept[WorkflowError.Locked] {
+      parent.recover(parentId)
+    }
+    runner.join()
+    assertEquals(result.get().get, 15)
   }
 }

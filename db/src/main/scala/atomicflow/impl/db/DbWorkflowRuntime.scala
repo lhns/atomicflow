@@ -34,7 +34,8 @@ class DbWorkflowRuntime[F[_] : Async](
     instanceId: WorkflowInstanceId,
     in: In,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Unit = {
     val workflowId = workflow.meta.id
     val workflowMeta = workflow.meta
@@ -55,7 +56,12 @@ class DbWorkflowRuntime[F[_] : Async](
             )
 
           case None =>
-            sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($instanceId, $workflowId, $input)"
+            val rootWorkflowId = parent.fold(workflowId)(_.rootWorkflowId)
+            val rootInstanceId = parent.fold(instanceId)(_.rootInstanceId)
+            sql"""
+            INSERT INTO workflow_instance (id, workflow_id, input, root_workflow_id, root_instance_id)
+            VALUES ($instanceId, $workflowId, $input, $rootWorkflowId, $rootInstanceId)
+            """
               .update
               .run
               .void
@@ -68,24 +74,26 @@ class DbWorkflowRuntime[F[_] : Async](
     instanceId: WorkflowInstanceId,
     in: In,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Out = {
-    createWorkflowInstance(workflow, instanceId, in, defaultCacheTtl, stepIdempotencyIdOverrides)
-    recoverWorkflowInstance(workflow, instanceId, defaultCacheTtl, stepIdempotencyIdOverrides)
+    createWorkflowInstance(workflow, instanceId, in, defaultCacheTtl, stepIdempotencyIdOverrides, parent)
+    recoverWorkflowInstance(workflow, instanceId, defaultCacheTtl, stepIdempotencyIdOverrides, parent)
   }
 
   override def recoverWorkflowInstance[In: Cacheable, Out](
     workflow: Workflow[In, Out],
     instanceId: WorkflowInstanceId,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Out = {
     val workflowMeta = workflow.meta
     val lockToken = UUID.randomUUID()
 
-    val input: Array[Byte] = runSync {
+    val (input, storedRoot) = runSync {
       acquireLock(instanceId, lockToken).flatMap {
-        case Some(input) => Monad[ConnectionIO].pure(input)
+        case Some(acquired) => Monad[ConnectionIO].pure(acquired)
         case None =>
           sql"SELECT 1 FROM workflow_instance WHERE id = $instanceId".query[Int].option.map {
             case None => throw WorkflowError.NotFound(workflowMeta, instanceId)
@@ -96,6 +104,7 @@ class DbWorkflowRuntime[F[_] : Async](
 
     val _instanceId = instanceId
     val _defaultCacheTtl = defaultCacheTtl
+    val _parent = parent
     val ctx = new atomicflow.WorkflowContext {
       override val meta: WorkflowMeta = workflowMeta
 
@@ -118,9 +127,22 @@ class DbWorkflowRuntime[F[_] : Async](
       override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
         _defaultCacheTtl
 
+      override protected[atomicflow] val parent: Option[atomicflow.WorkflowContext] = _parent
+
+      // Instances created before root links existed are their own root.
+      override protected[atomicflow] val rootWorkflowId: WorkflowId = storedRoot.fold(workflowMeta.id)(_._1)
+
+      override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = storedRoot.fold(_instanceId)(_._2)
+
       @volatile private var lockRenewedAt: Long = System.nanoTime()
 
-      override protected[atomicflow] def checkpoint(): Unit =
+      // Also renews the ancestors' locks: a parent reaches no checkpoint of its own while its child runs inline.
+      override protected[atomicflow] def checkpoint(): Unit = {
+        _parent.foreach(_.checkpoint())
+        renewLockIfDue()
+      }
+
+      private def renewLockIfDue(): Unit =
         if (System.nanoTime() - lockRenewedAt > lockTimeout.toNanos / 2) {
           val renewedAt = System.nanoTime()
           val renewed = runSync {
@@ -151,14 +173,20 @@ class DbWorkflowRuntime[F[_] : Async](
 
   private val lockTimeoutSeconds: Double = lockTimeout.toMillis / 1000.0
 
-  /** Atomically acquires the execution lock if it is free or expired; returns the instance input on success. */
-  private def acquireLock(instanceId: WorkflowInstanceId, lockToken: UUID): ConnectionIO[Option[Array[Byte]]] =
+  /** Atomically acquires the execution lock if it is free or expired.
+    * Returns the instance input and its root (if recorded) on success. */
+  private def acquireLock(
+                           instanceId: WorkflowInstanceId,
+                           lockToken: UUID
+                         ): ConnectionIO[Option[(Array[Byte], Option[(WorkflowId, WorkflowInstanceId)])]] =
     sql"""
     UPDATE workflow_instance
     SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds), lock_owner = $lockToken
     WHERE id = $instanceId AND (locked_until IS NULL OR locked_until < now())
-    RETURNING input
-    """.query[Array[Byte]].option
+    RETURNING input, root_workflow_id, root_instance_id
+    """.query[(Array[Byte], Option[WorkflowId], Option[WorkflowInstanceId])].option.map(_.map {
+      case (input, rootWorkflowId, rootInstanceId) => (input, rootWorkflowId.zip(rootInstanceId))
+    })
 
   /** Guards writes of step state: they only apply while the given lock token still owns the instance. */
   private def ownsLock(instanceId: WorkflowInstanceId, lockToken: UUID): Fragment =

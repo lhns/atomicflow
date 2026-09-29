@@ -31,6 +31,14 @@ trait WorkflowContext {
 
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
 
+  /** The context of the enclosing workflow run when this instance runs as a child. */
+  protected[atomicflow] def parent: Option[WorkflowContext]
+
+  /** The top-level instance of the tree this instance belongs to (itself for top-level instances). */
+  protected[atomicflow] def rootWorkflowId: WorkflowId
+
+  protected[atomicflow] def rootInstanceId: WorkflowInstanceId
+
   /** Called before any uncached (new) work in this instance. Runtimes use it to keep their execution lock alive and
     * throw [[WorkflowError.Locked]] if it was lost, so a run that lost its lock never starts new work. */
   protected[atomicflow] def checkpoint(): Unit = ()

@@ -111,7 +111,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                              defaultCacheTtl: FiniteDuration,
                                              stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
                                              stepCache: WorkflowStepCache,
-                                             stepIdempotencyStore: WorkflowIdempotencyStore
+                                             stepIdempotencyStore: WorkflowIdempotencyStore,
+                                             rootWorkflowId: WorkflowId,
+                                             rootInstanceId: WorkflowInstanceId
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
@@ -121,7 +123,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     instanceId: WorkflowInstanceId,
     in: In,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Unit = {
     workflowInstances.updateAndGet { instances =>
       instances.get(instanceId) match {
@@ -142,7 +145,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             defaultCacheTtl = defaultCacheTtl,
             stepIdempotencyIdOverrides = stepIdempotencyIdOverrides,
             stepCache = new WorkflowStepCache(),
-            stepIdempotencyStore = new WorkflowIdempotencyStore()
+            stepIdempotencyStore = new WorkflowIdempotencyStore(),
+            rootWorkflowId = parent.fold(workflow.meta.id)(_.rootWorkflowId),
+            rootInstanceId = parent.fold(instanceId)(_.rootInstanceId)
           ))
       }
     }
@@ -153,17 +158,19 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     instanceId: WorkflowInstanceId,
     in: In,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Out = {
-    createWorkflowInstance(workflow, instanceId, in, defaultCacheTtl, stepIdempotencyIdOverrides)
-    recoverWorkflowInstance(workflow, instanceId, defaultCacheTtl, stepIdempotencyIdOverrides)
+    createWorkflowInstance(workflow, instanceId, in, defaultCacheTtl, stepIdempotencyIdOverrides, parent)
+    recoverWorkflowInstance(workflow, instanceId, defaultCacheTtl, stepIdempotencyIdOverrides, parent)
   }
 
   override def recoverWorkflowInstance[In: Cacheable, Out](
     workflow: Workflow[In, Out],
     instanceId: WorkflowInstanceId,
     defaultCacheTtl: FiniteDuration,
-    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+    stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId],
+    parent: Option[WorkflowContext]
   ): Out = {
     workflowInstances.get().get(instanceId) match {
       case Some(state: WorkflowState[In, Out] @unchecked) =>
@@ -176,6 +183,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
           try {
             val _instanceId = instanceId
             val _defaultCacheTtl = defaultCacheTtl
+            val _parent = parent
             val ctx = new WorkflowContext {
               override val meta: WorkflowMeta = workflow.meta
 
@@ -196,6 +204,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
                 _defaultCacheTtl
+
+              override protected[atomicflow] val parent: Option[WorkflowContext] = _parent
+
+              override protected[atomicflow] val rootWorkflowId: WorkflowId = state.rootWorkflowId
+
+              override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = state.rootInstanceId
             }
             workflow.body(ctx, state.in)
           } finally {

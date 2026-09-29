@@ -617,6 +617,22 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(attempts.get(), 2)
   }
 
+  test("Child runs inherit the parent's cache TTL") {
+    val child = Workflow["6a2d8e1f-3b4c-4d5e-8f60-7a1b2c3d4e01"]("ttl child")[Unit, Long] { _ =>
+      Workflow.cacheTtl.toHours
+    }
+
+    val parent = Workflow["6a2d8e1f-3b4c-4d5e-8f60-7a1b2c3d4e02"]("ttl parent")[Unit, (Long, Long)] { _ =>
+      val viaRunChild = child.runChild("c")
+      val viaSub = Workflow.sub["6a2d8e1f-3b4c-4d5e-8f60-7a1b2c3d4e03"]("s") {
+        Workflow.cacheTtl.toHours
+      }
+      (viaRunChild, viaSub)
+    }
+
+    assertEquals(parent.run(WorkflowInstanceId.generate, (), cacheTtl = 3.hours), (3L, 3L))
+  }
+
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)
