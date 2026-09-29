@@ -746,6 +746,22 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(errors.get(), 2)
   }
 
+  test("versionAtCreation keeps instances created by older code on their old path") {
+    val v1 = Workflow["4b8d2f6a-0c1e-4a3b-9d5f-7e9a1b3c5d01"]("versioned")[Unit, String] { _ =>
+      "v1 body"
+    }
+    val v2 = Workflow["4b8d2f6a-0c1e-4a3b-9d5f-7e9a1b3c5d01"]("versioned", version = 2)[Unit, String] { _ =>
+      if (Workflow.versionAtCreation >= 2) "new path" else "old path"
+    }
+
+    val oldInstance = WorkflowInstanceId.generate
+    v1.create(oldInstance)
+
+    // After a deployment of v2, the in-flight v1 instance keeps its path; new instances take the new one
+    assertEquals(v2.recover(oldInstance), "old path")
+    assertEquals(v2.run(WorkflowInstanceId.generate), "new path")
+  }
+
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)

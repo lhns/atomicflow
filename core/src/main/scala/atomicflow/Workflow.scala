@@ -126,11 +126,18 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
 }
 
 object Workflow {
-  inline def apply[UUID <: String & Singleton](name: String): WorkflowBuilder =
+  /** @param version the version of the workflow's code, see [[versionAtCreation]] */
+  inline def apply[UUID <: String & Singleton](name: String, version: Int = 1): WorkflowBuilder =
     new WorkflowBuilder(
       WorkflowId(constValue[UUID]),
-      name
+      name,
+      version
     )
+
+  /** The workflow version that created the current instance. Branch on it to evolve a workflow's code while instances
+    * created by older versions are still running, e.g. `if (Workflow.versionAtCreation >= 2) newPath else oldPath`. */
+  def versionAtCreation(using ctx: WorkflowContext): Int =
+    ctx.versionAtCreation
 
   inline def sub[UUID <: String & Singleton]: SubWorkflowBuilder =
     new SubWorkflowBuilder(WorkflowId(constValue[UUID]))

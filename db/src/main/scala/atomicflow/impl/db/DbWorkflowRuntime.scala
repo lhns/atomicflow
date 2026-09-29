@@ -60,8 +60,8 @@ class DbWorkflowRuntime[F[_] : Async](
             val rootWorkflowId = parent.fold(workflowId)(_.rootWorkflowId)
             val rootInstanceId = parent.fold(instanceId)(_.rootInstanceId)
             sql"""
-            INSERT INTO workflow_instance (id, workflow_id, input, root_workflow_id, root_instance_id)
-            VALUES ($instanceId, $workflowId, $input, $rootWorkflowId, $rootInstanceId)
+            INSERT INTO workflow_instance (id, workflow_id, input, root_workflow_id, root_instance_id, workflow_version)
+            VALUES ($instanceId, $workflowId, $input, $rootWorkflowId, $rootInstanceId, ${workflow.meta.version})
             """
               .update
               .run
@@ -93,9 +93,9 @@ class DbWorkflowRuntime[F[_] : Async](
     val workflowMeta = workflow.meta
     val lockToken = UUID.randomUUID()
 
-    val (input, storedRoot) = runSync {
+    val Acquired(input, storedRoot, storedVersion) = runSync {
       acquireLock(instanceId, lockToken).flatMap {
-        case Some(acquired @ (_, root)) =>
+        case Some(acquired @ Acquired(_, root, _)) =>
           // Crash safety for roots: until this run finishes, its wakeup is postponed by the lock timeout, so a run
           // interrupted by a dead process is retried once its lock has expired.
           if (root.forall(_._2 == instanceId)) claimOwnWakeup(workflowMeta.id, instanceId, lockToken).as(acquired)
@@ -139,6 +139,8 @@ class DbWorkflowRuntime[F[_] : Async](
       override protected[atomicflow] val rootWorkflowId: WorkflowId = storedRoot.fold(workflowMeta.id)(_._1)
 
       override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = storedRoot.fold(_instanceId)(_._2)
+
+      override protected[atomicflow] val versionAtCreation: Int = storedVersion
 
       @volatile private var lockRenewedAt: Long = System.nanoTime()
 
@@ -189,19 +191,22 @@ class DbWorkflowRuntime[F[_] : Async](
 
   private val lockTimeoutSeconds: Double = lockTimeout.toMillis / 1000.0
 
-  /** Atomically acquires the execution lock if it is free or expired.
-    * Returns the instance input and its root (if recorded) on success. */
+  /** What a run learns about its instance when it acquires the lock. `root` is not recorded for instances created
+    * before root links existed. */
+  private case class Acquired(input: Array[Byte], root: Option[(WorkflowId, WorkflowInstanceId)], versionAtCreation: Int)
+
+  /** Atomically acquires the execution lock if it is free or expired. */
   private def acquireLock(
                            instanceId: WorkflowInstanceId,
                            lockToken: UUID
-                         ): ConnectionIO[Option[(Array[Byte], Option[(WorkflowId, WorkflowInstanceId)])]] =
+                         ): ConnectionIO[Option[Acquired]] =
     sql"""
     UPDATE workflow_instance
     SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds), lock_owner = $lockToken
     WHERE id = $instanceId AND (locked_until IS NULL OR locked_until < now())
-    RETURNING input, root_workflow_id, root_instance_id
-    """.query[(Array[Byte], Option[WorkflowId], Option[WorkflowInstanceId])].option.map(_.map {
-      case (input, rootWorkflowId, rootInstanceId) => (input, rootWorkflowId.zip(rootInstanceId))
+    RETURNING input, root_workflow_id, root_instance_id, workflow_version
+    """.query[(Array[Byte], Option[WorkflowId], Option[WorkflowInstanceId], Int)].option.map(_.map {
+      case (input, rootWorkflowId, rootInstanceId, version) => Acquired(input, rootWorkflowId.zip(rootInstanceId), version)
     })
 
   private val retryBackoffSeconds: Double = retryBackoff.toMillis / 1000.0

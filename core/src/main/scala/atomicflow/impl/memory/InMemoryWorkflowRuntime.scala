@@ -118,7 +118,8 @@ class InMemoryWorkflowRuntime(
                                              stepCache: WorkflowStepCache,
                                              stepIdempotencyStore: WorkflowIdempotencyStore,
                                              rootWorkflowId: WorkflowId,
-                                             rootInstanceId: WorkflowInstanceId
+                                             rootInstanceId: WorkflowInstanceId,
+                                             versionAtCreation: Int
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
@@ -153,7 +154,8 @@ class InMemoryWorkflowRuntime(
             stepCache = new WorkflowStepCache(),
             stepIdempotencyStore = new WorkflowIdempotencyStore(),
             rootWorkflowId = parent.fold(workflow.meta.id)(_.rootWorkflowId),
-            rootInstanceId = parent.fold(instanceId)(_.rootInstanceId)
+            rootInstanceId = parent.fold(instanceId)(_.rootInstanceId),
+            versionAtCreation = workflow.meta.version
           ))
       }
     }
@@ -220,6 +222,8 @@ class InMemoryWorkflowRuntime(
               override protected[atomicflow] val rootWorkflowId: WorkflowId = state.rootWorkflowId
 
               override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = state.rootInstanceId
+
+              override protected[atomicflow] val versionAtCreation: Int = state.versionAtCreation
             }
             val result =
               try workflow.body(ctx, state.in)

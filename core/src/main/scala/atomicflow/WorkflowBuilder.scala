@@ -1,11 +1,12 @@
 package atomicflow
 
-class WorkflowBuilder(id: WorkflowId, name: String) {
+class WorkflowBuilder(id: WorkflowId, name: String, version: Int) {
   def apply[In: Cacheable, Out](body: In => WorkflowContext ?=> Out): Workflow[In, Out] = {
     val workflowMeta = WorkflowMeta(
       id = id,
       name = name,
-      description = None
+      description = None,
+      version = version
     )
 
     new Workflow[In, Out](

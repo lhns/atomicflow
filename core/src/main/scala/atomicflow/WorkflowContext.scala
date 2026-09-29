@@ -31,6 +31,9 @@ trait WorkflowContext {
 
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
 
+  /** The workflow version (`WorkflowMeta.version`) this instance was created with. */
+  protected[atomicflow] def versionAtCreation: Int
+
   /** The context of the enclosing workflow run when this instance runs as a child. */
   protected[atomicflow] def parent: Option[WorkflowContext]
 
