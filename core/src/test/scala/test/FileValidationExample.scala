@@ -93,7 +93,7 @@ object FileValidationExample {
       val pendings = files.flatMap { fileId =>
         Workflow.orPending(fileWorkflow.runChild(fileId, fileId)).left.toOption
       }
-      pendings.headOption.foreach(e => throw e)
+      pendings.headOption.foreach(Workflow.pending)
     }
 
     val scanKey = "scan-2026-08-03"

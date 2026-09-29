@@ -14,6 +14,9 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
   given WorkflowRuntime = createWorkflowRuntime
 
+  // Business keys derive deterministic instance ids; persistent runtimes keep them across suite runs.
+  private val runTag = java.util.UUID.randomUUID().toString
+
   private lazy val emptyWorkflow = Workflow["d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"]("read and send files")[String, Int] { (string: String) =>
     if (string == "answer")
       42
@@ -364,18 +367,18 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       }
     }
 
-    assertEquals(workflow.keyedInstanceId("k1"), workflow.keyedInstanceId("k1"))
-    assertNotEquals(workflow.keyedInstanceId("k1"), workflow.keyedInstanceId("k2"))
+    assertEquals(workflow.keyedInstanceId(s"k1-$runTag"), workflow.keyedInstanceId(s"k1-$runTag"))
+    assertNotEquals(workflow.keyedInstanceId(s"k1-$runTag"), workflow.keyedInstanceId(s"k2-$runTag"))
 
-    assertEquals(workflow.runKeyed("k1", "a"), 1)
-    assertEquals(workflow.runKeyed("k1", "a"), 1)
+    assertEquals(workflow.runKeyed(s"k1-$runTag", "a"), 1)
+    assertEquals(workflow.runKeyed(s"k1-$runTag", "a"), 1)
     assertEquals(counter.get(), 1)
 
     intercept[WorkflowError.InputConflict] {
-      workflow.runKeyed("k1", "b")
+      workflow.runKeyed(s"k1-$runTag", "b")
     }
 
-    assertEquals(workflow.runKeyed("k2", "a"), 2)
+    assertEquals(workflow.runKeyed(s"k2-$runTag", "a"), 2)
   }
 
   test("childInstanceId should address a child instance for external signals") {
@@ -476,13 +479,13 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       val pendings = files.flatMap { fileId =>
         Workflow.orPending(fileWorkflow.runChild(fileId, fileId)).left.toOption
       }
-      pendings.headOption.foreach(e => throw e)
+      pendings.headOption.foreach(Workflow.pending)
     }
 
     def counters =
       (listCalls.get(), downloads.get(), validationRequests.get(), correctionRequests.get(), successResponses.get())
 
-    val scanKey = "scan-2026-08-03"
+    val scanKey = s"scan-$runTag"
     val rootId = allFilesWorkflow.keyedInstanceId(scanKey)
 
     // External actors address an attempt knowing only root id, file id and revision.
@@ -542,5 +545,40 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     // Replay after completion changes nothing
     allFilesWorkflow.recover(rootId)
     assertEquals(counters, (1, 4, 4, 1, 3))
+  }
+
+  test("Pending cannot be swallowed by Try or NonFatal catches") {
+    val signal = Signal[String](SignalId("8d0b3f43-4f0b-4a4e-9a57-2b0f1f6f0a01"))
+
+    val workflow = Workflow["8d0b3f43-4f0b-4a4e-9a57-2b0f1f6f0a02"]("swallowing workflow")[Unit, String] { _ =>
+      val viaTry = scala.util.Try(signal.value).getOrElse("swallowed by Try")
+      val viaCatch =
+        try signal.value
+        catch {
+          case scala.util.control.NonFatal(_) => "swallowed by NonFatal"
+          case _: Exception => "swallowed by Exception"
+        }
+      s"$viaTry/$viaCatch"
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+
+    intercept[WorkflowError.SignalEmpty] {
+      workflow.run(instanceId)
+    }
+
+    workflow.setSignal(instanceId, signal, "v")
+    assertEquals(workflow.recover(instanceId), "v/v")
+
+    // A pending child cannot be swallowed by the parent either
+    val parent = Workflow["8d0b3f43-4f0b-4a4e-9a57-2b0f1f6f0a03"]("swallowing parent")[Unit, String] { _ =>
+      scala.util.Try(workflow.runChild("c")).getOrElse("swallowed child")
+    }
+    val parentId = WorkflowInstanceId.generate
+    intercept[WorkflowError.SignalEmpty] {
+      parent.run(parentId)
+    }
+    workflow.setSignal(workflow.childInstanceId(parentId, "c"), signal, "w")
+    assertEquals(parent.recover(parentId), "w/w")
   }
 }

@@ -214,7 +214,7 @@ child runs in `Workflow.orPending` and rethrow at the end so the parent stays pe
 val pendings = files.flatMap { file =>
   Workflow.orPending(perFile.runChild(file, file)).left.toOption
 }
-pendings.headOption.foreach(e => throw e)
+pendings.headOption.foreach(Workflow.pending)
 ```
 
 **Retries are business logic**, not a library feature: key each retry attempt by a domain

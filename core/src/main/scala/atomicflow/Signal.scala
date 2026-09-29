@@ -19,7 +19,7 @@ trait Signal[A] {
 
   @throws[WorkflowError.SignalEmpty]
   def value(using workflowCtx: WorkflowContext): A =
-    option.getOrElse(throw WorkflowError.SignalEmpty(workflowCtx.meta, workflowCtx.instanceId, this))
+    option.getOrElse(throw PendingSignal(WorkflowError.SignalEmpty(workflowCtx.meta, workflowCtx.instanceId, this)))
 
   override def toString: String = s"signal:${meta.id}${meta.name.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
 }

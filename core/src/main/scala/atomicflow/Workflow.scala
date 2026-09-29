@@ -14,7 +14,7 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
            cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
            stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
          )(using rt: WorkflowRuntime): Out =
-    rt.runWorkflowInstance(this, instanceId, in, cacheTtl, stepIdempotencyIdOverrides)
+    Workflow.unwrapPending(rt.runWorkflowInstance(this, instanceId, in, cacheTtl, stepIdempotencyIdOverrides))
 
   @throws[WorkflowError.InputConflict]
   inline def run(
@@ -29,7 +29,7 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
               cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
               stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
             )(using rt: WorkflowRuntime): Unit =
-    rt.createWorkflowInstance(this, instanceId, in, cacheTtl, stepIdempotencyIdOverrides)
+    Workflow.unwrapPending(rt.createWorkflowInstance(this, instanceId, in, cacheTtl, stepIdempotencyIdOverrides))
 
   @throws[WorkflowError.InputConflict]
   inline def create(
@@ -43,7 +43,7 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
                cacheTtl: FiniteDuration = Constants.defaultCacheTtl,
                stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
              )(using rt: WorkflowRuntime): Out =
-    rt.recoverWorkflowInstance(this, instanceId, cacheTtl, stepIdempotencyIdOverrides)
+    Workflow.unwrapPending(rt.recoverWorkflowInstance(this, instanceId, cacheTtl, stepIdempotencyIdOverrides))
 
   @throws[WorkflowError.NotFound]
   @throws[WorkflowError.SignalConflict]
@@ -67,7 +67,8 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
     discriminator: String,
     in: In
   )(using ctx: WorkflowContext): Out =
-    run(childInstanceId(ctx.instanceId, discriminator), in)(using ctx.runtime)
+    // Deliberately bypasses `run`: pending must keep travelling as a control throwable through the parent body.
+    ctx.runtime.runWorkflowInstance(this, childInstanceId(ctx.instanceId, discriminator), in, Constants.defaultCacheTtl, Map.empty)
 
   inline def runChild(
     discriminator: String
@@ -137,9 +138,21 @@ object Workflow {
 
   /** Runs `body`; a pending abort (a [[WorkflowError.SignalEmpty]] from the subtree —
     * typically a child run awaiting a signal) becomes a `Left` instead of propagating,
-    * so sibling work can proceed. Rethrow a collected `Left` at the end of the parent
-    * body to keep the parent itself pending. */
+    * so sibling work can proceed. Rethrow a collected `Left` with [[pending]] at the end
+    * of the parent body to keep the parent itself pending. */
   def orPending[A](body: => A): Either[WorkflowError.SignalEmpty, A] =
     try Right(body)
-    catch case e: WorkflowError.SignalEmpty => Left(e)
+    catch {
+      case p: PendingSignal => Left(p.error)
+      case e: WorkflowError.SignalEmpty => Left(e)
+    }
+
+  /** Aborts the current run as pending, e.g. with a pending result collected by [[orPending]].
+    * Unlike `throw e`, business code catching `NonFatal` cannot swallow it. */
+  def pending(e: WorkflowError.SignalEmpty): Nothing =
+    throw PendingSignal(e)
+
+  private[atomicflow] inline def unwrapPending[A](inline body: A): A =
+    try body
+    catch case p: PendingSignal => throw p.error
 }
