@@ -26,7 +26,8 @@ import scala.concurrent.duration.FiniteDuration
 class DbWorkflowRuntime[F[_] : Async](
                                         xa: Transactor[F],
                                         dispatcher: Dispatcher[F],
-                                        lockTimeout: FiniteDuration = DbWorkflowRuntime.defaultLockTimeout
+                                        lockTimeout: FiniteDuration = DbWorkflowRuntime.defaultLockTimeout,
+                                        retryBackoff: FiniteDuration = DbWorkflowRuntime.defaultRetryBackoff
                                       ) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
   override def createWorkflowInstance[In: Cacheable, Out](
@@ -64,7 +65,8 @@ class DbWorkflowRuntime[F[_] : Async](
             """
               .update
               .run
-              .void
+              .void >>
+              (if (parent.isEmpty) scheduleWakeupNow(workflowId, instanceId, ifAbsent = true) else Monad[ConnectionIO].unit)
         }
     }
   }
@@ -93,7 +95,11 @@ class DbWorkflowRuntime[F[_] : Async](
 
     val (input, storedRoot) = runSync {
       acquireLock(instanceId, lockToken).flatMap {
-        case Some(acquired) => Monad[ConnectionIO].pure(acquired)
+        case Some(acquired @ (_, root)) =>
+          // Crash safety for roots: until this run finishes, its wakeup is postponed by the lock timeout, so a run
+          // interrupted by a dead process is retried once its lock has expired.
+          if (root.forall(_._2 == instanceId)) claimOwnWakeup(workflowMeta.id, instanceId, lockToken).as(acquired)
+          else Monad[ConnectionIO].pure(acquired)
         case None =>
           sql"SELECT 1 FROM workflow_instance WHERE id = $instanceId".query[Int].option.map {
             case None => throw WorkflowError.NotFound(workflowMeta, instanceId)
@@ -157,8 +163,17 @@ class DbWorkflowRuntime[F[_] : Async](
         }
     }
 
+    var outcome: Option[Throwable] = Some(new IllegalStateException("run did not finish"))
     try {
-      workflow.body(ctx, Cacheable[In].deserialize(input.asInstanceOf[IArray[Byte]]))
+      val result =
+        try workflow.body(ctx, Cacheable[In].deserialize(input.asInstanceOf[IArray[Byte]]))
+        catch {
+          case e: Throwable =>
+            outcome = Some(e)
+            throw e
+        }
+      outcome = None
+      result
     } finally {
       // Only release the lock if we still own it: after expiry another run may have taken it over.
       runSync {
@@ -166,7 +181,8 @@ class DbWorkflowRuntime[F[_] : Async](
         UPDATE workflow_instance
         SET locked_until = NULL, lock_owner = NULL
         WHERE id = $instanceId AND lock_owner = $lockToken
-        """.update.run
+        """.update.run >>
+          completeOwnWakeup(instanceId, lockToken, WorkflowRuntime.isFinished(outcome))
       }
     }
   }
@@ -187,6 +203,70 @@ class DbWorkflowRuntime[F[_] : Async](
     """.query[(Array[Byte], Option[WorkflowId], Option[WorkflowInstanceId])].option.map(_.map {
       case (input, rootWorkflowId, rootInstanceId) => (input, rootWorkflowId.zip(rootInstanceId))
     })
+
+  private val retryBackoffSeconds: Double = retryBackoff.toMillis / 1000.0
+
+  private val maxRetryDelaySeconds: Double = WorkflowRuntime.maxRetryDelay.toMillis / 1000.0
+
+  private def scheduleWakeupNow(workflowId: WorkflowId, instanceId: WorkflowInstanceId, ifAbsent: Boolean): ConnectionIO[Unit] =
+    (sql"""
+    INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
+    VALUES ($instanceId, $workflowId, now(), 0, NULL)
+    ON CONFLICT (root_instance_id) DO """ ++
+      (if (ifAbsent) fr"NOTHING" else fr"UPDATE SET scheduled_at = now(), attempts = 0, claim_token = NULL")
+      ).update.run.void
+
+  private def claimOwnWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, lockToken: UUID): ConnectionIO[Unit] =
+    sql"""
+    INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
+    VALUES ($instanceId, $workflowId, now() + make_interval(secs => $lockTimeoutSeconds), 0, $lockToken)
+    ON CONFLICT (root_instance_id) DO UPDATE
+    SET scheduled_at = EXCLUDED.scheduled_at, claim_token = EXCLUDED.claim_token
+    """.update.run.void
+
+  /** A finished run removes its wakeup; a failed run retries with backoff. Either only applies if the wakeup was not
+    * touched during the run (e.g. by a signal, which must lead to another pass). */
+  private def completeOwnWakeup(instanceId: WorkflowInstanceId, lockToken: UUID, finished: Boolean): ConnectionIO[Unit] =
+    if (finished)
+      sql"DELETE FROM workflow_wakeup WHERE root_instance_id = $instanceId AND claim_token = $lockToken".update.run.void
+    else
+      sql"""
+      UPDATE workflow_wakeup
+      SET scheduled_at = now() + make_interval(secs => LEAST($retryBackoffSeconds * power(2, LEAST(attempts, 30)), $maxRetryDelaySeconds)),
+          attempts = attempts + 1,
+          claim_token = NULL
+      WHERE root_instance_id = $instanceId AND claim_token = $lockToken
+      """.update.run.void
+
+  override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
+    if (workflowIds.isEmpty) Seq.empty
+    else {
+      val ids: Array[UUID] = workflowIds.toArray.map(id => UUID.fromString(WorkflowId.unwrap(id)))
+      runSync {
+        sql"""
+        UPDATE workflow_wakeup
+        SET scheduled_at = now() + make_interval(secs => $lockTimeoutSeconds)
+        WHERE root_instance_id IN (
+          SELECT root_instance_id FROM workflow_wakeup
+          WHERE scheduled_at <= now() AND root_workflow_id = ANY($ids)
+          ORDER BY scheduled_at
+          LIMIT $limit
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING root_workflow_id, root_instance_id, attempts
+        """.query[(WorkflowId, WorkflowInstanceId, Int)].to[List]
+      }.map { case (workflowId, instanceId, attempts) => WorkflowRuntime.Wakeup(workflowId, instanceId, attempts) }
+    }
+
+  override def scheduleWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit =
+    runSync {
+      sql"""
+      INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
+      VALUES ($instanceId, $workflowId, now() + make_interval(secs => ${delay.toMillis / 1000.0}), 0, NULL)
+      ON CONFLICT (root_instance_id) DO UPDATE
+      SET scheduled_at = EXCLUDED.scheduled_at, claim_token = NULL
+      """.update.run.void
+    }
 
   /** Guards writes of step state: they only apply while the given lock token still owns the instance. */
   private def ownsLock(instanceId: WorkflowInstanceId, lockToken: UUID): Fragment =
@@ -398,18 +478,28 @@ class DbWorkflowRuntime[F[_] : Async](
                 FROM workflow_instance
                 WHERE id = ${workflowScope.workflowInstanceId}
               )
-              """.update.run.map {
+              """.update.run.flatMap {
                   case 0 => throw WorkflowError.NotFound(
                     workflowScope.workflowMeta,
                     workflowScope.workflowInstanceId
                   )
-                case 1 => ()
+                case _ => wakeRoot(workflowScope.workflowInstanceId)
               }
           }
         }
       }
     }
   }
+
+  /** Wakes up the root of the given instance's tree (instances without a recorded root are their own root). */
+  private def wakeRoot(instanceId: WorkflowInstanceId): ConnectionIO[Unit] =
+    sql"""
+    INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
+    SELECT COALESCE(root_instance_id, id), COALESCE(root_workflow_id, workflow_id::uuid), now(), 0, NULL
+    FROM workflow_instance WHERE id = $instanceId
+    ON CONFLICT (root_instance_id) DO UPDATE
+    SET scheduled_at = now(), attempts = 0, claim_token = NULL
+    """.update.run.void
 
   private def runSync[A](fa: ConnectionIO[A]): A =
     dispatcher.unsafeRunSync(fa.transact(xa))
@@ -424,6 +514,9 @@ class DbWorkflowRuntime[F[_] : Async](
 object DbWorkflowRuntime {
   val defaultLockTimeout: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.MINUTES)
 
+  /** Base delay of the exponential backoff for retrying failed runs via wakeups. */
+  val defaultRetryBackoff: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.SECONDS)
+
   /** @param lockTimeout how long an execution lock stays valid without renewal. Runs renew it at every checkpoint
     *                    (before new step work), so a single step body must finish within this timeout. */
   case class DbConfig(
@@ -432,7 +525,8 @@ object DbWorkflowRuntime {
                        user: String,
                        password: String,
                        poolSize: Option[Int],
-                       lockTimeout: FiniteDuration = defaultLockTimeout
+                       lockTimeout: FiniteDuration = defaultLockTimeout,
+                       retryBackoff: FiniteDuration = defaultRetryBackoff
                      ) {
     def driverOrDefault: String = driver.getOrElse("org.postgresql.Driver")
 
@@ -468,7 +562,7 @@ object DbWorkflowRuntime {
       dispatcher <- Dispatcher.parallel[IO]
       xa <- transactor(config)
     } yield
-      new DbWorkflowRuntime[IO](xa, dispatcher, config.lockTimeout))
+      new DbWorkflowRuntime[IO](xa, dispatcher, config.lockTimeout, config.retryBackoff))
       .allocated.map(_._1)
       .unsafeRunSync()(cats.effect.unsafe.IORuntime.global)
   }

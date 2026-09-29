@@ -5,10 +5,15 @@ import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, StepScope, StepState, WorkflowScope}
 
+import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
 
-class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
+/** @param retryBackoff base delay of the exponential backoff for retrying failed runs via wakeups */
+class InMemoryWorkflowRuntime(
+                               retryBackoff: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.SECONDS)
+                             ) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
   class WorkflowIdempotencyStore {
     sealed trait IdempotencyIdKey
 
@@ -138,6 +143,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             instances
           }
         case None =>
+          if (parent.isEmpty) wakeups.schedule(workflow.meta.id, instanceId, Instant.now(), claimedBy = None, resetAttempts = true, ifAbsent = true)
           instances + (instanceId -> WorkflowState(
             locked = new AtomicBoolean(false),
             in = in,
@@ -180,6 +186,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             instanceId
           )
         } else {
+          val isRoot = state.rootInstanceId == instanceId
+          val claimToken = UUID.randomUUID()
+          if (isRoot) wakeups.schedule(workflow.meta.id, instanceId, Instant.now().plusMillis(wakeupClaimTimeout.toMillis), claimedBy = Some(claimToken), resetAttempts = false, ifAbsent = false)
+          var outcome: Option[Throwable] = Some(new IllegalStateException("run did not finish"))
           try {
             val _instanceId = instanceId
             val _defaultCacheTtl = defaultCacheTtl
@@ -211,9 +221,18 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = state.rootInstanceId
             }
-            workflow.body(ctx, state.in)
+            val result =
+              try workflow.body(ctx, state.in)
+              catch {
+                case e: Throwable =>
+                  outcome = Some(e)
+                  throw e
+              }
+            outcome = None
+            result
           } finally {
             state.locked.set(false)
+            if (isRoot) wakeups.completeRun(instanceId, claimToken, WorkflowRuntime.isFinished(outcome))
           }
         }
 
@@ -261,14 +280,76 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
   private val signalStore = new WorkflowSignalStore
 
+  /** In-memory state dies with the process, so claimed wakeups only need to outlive a crashed worker thread. */
+  private val wakeupClaimTimeout: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.MINUTES)
+
+  private case class WakeupState(workflowId: WorkflowId, scheduledAt: Instant, attempts: Int, claimedBy: Option[UUID])
+
+  private object wakeups {
+    private var states: Map[WorkflowInstanceId, WakeupState] = Map.empty
+
+    def schedule(
+                  workflowId: WorkflowId,
+                  instanceId: WorkflowInstanceId,
+                  at: Instant,
+                  claimedBy: Option[UUID],
+                  resetAttempts: Boolean,
+                  ifAbsent: Boolean
+                ): Unit = synchronized {
+      states.get(instanceId) match {
+        case Some(_) if ifAbsent => ()
+        case existing =>
+          val attempts = if (resetAttempts) 0 else existing.fold(0)(_.attempts)
+          states += instanceId -> WakeupState(workflowId, at, attempts, claimedBy)
+      }
+    }
+
+    /** A finished run removes its wakeup; a failed run retries with backoff. Either only applies if the wakeup was not
+      * touched during the run (e.g. by a signal, which must lead to another pass). */
+    def completeRun(instanceId: WorkflowInstanceId, claimToken: UUID, finished: Boolean): Unit = synchronized {
+      states.get(instanceId) match {
+        case Some(state) if state.claimedBy.contains(claimToken) =>
+          if (finished) states -= instanceId
+          else states += instanceId -> state.copy(
+            scheduledAt = Instant.now().plusMillis(WorkflowRuntime.retryDelay(retryBackoff, state.attempts).toMillis),
+            attempts = state.attempts + 1,
+            claimedBy = None
+          )
+        case _ => ()
+      }
+    }
+
+    def claim(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] = synchronized {
+      val now = Instant.now()
+      val due = states.toSeq
+        .filter { case (_, state) => workflowIds.contains(state.workflowId) && !state.scheduledAt.isAfter(now) }
+        .sortBy(_._2.scheduledAt)
+        .take(limit)
+      due.foreach { case (instanceId, state) =>
+        states += instanceId -> state.copy(scheduledAt = now.plusMillis(wakeupClaimTimeout.toMillis))
+      }
+      due.map { case (instanceId, state) => WorkflowRuntime.Wakeup(state.workflowId, instanceId, state.attempts) }
+    }
+  }
+
+  override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
+    wakeups.claim(workflowIds, limit)
+
+  override def scheduleWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit =
+    wakeups.schedule(workflowId, instanceId, Instant.now().plusMillis(delay.toMillis), claimedBy = None, resetAttempts = false, ifAbsent = false)
+
   override def setSignal[A](
                              signal: Signal[A],
                              value: A,
                              ttl: FiniteDuration,
                              workflowMeta: WorkflowMeta,
                              workflowInstanceId: WorkflowInstanceId
-                           ): Unit =
+                           ): Unit = {
     signalStore
       .bind(WorkflowScope(workflowMeta, workflowInstanceId))
       .setSignalValue(signal, value, ttl)
+    workflowInstances.get().get(workflowInstanceId).foreach { state =>
+      wakeups.schedule(state.rootWorkflowId, state.rootInstanceId, Instant.now(), claimedBy = None, resetAttempts = true, ifAbsent = false)
+    }
+  }
 }

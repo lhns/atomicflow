@@ -61,6 +61,12 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     ): Out =
       unavailable
 
+    override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
+      unavailable
+
+    override def scheduleWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit =
+      unavailable
+
     override def setSignal[A](
                                signal: Signal[A],
                                value: A,
@@ -74,6 +80,10 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
   override def createWorkflowRuntime: WorkflowRuntime =
     if (missingDbVars.nonEmpty) UnavailableRuntime
     else DbWorkflowRuntime(dbConfig)
+
+  override def createWorkflowRuntime(retryBackoff: FiniteDuration): WorkflowRuntime =
+    if (missingDbVars.nonEmpty) UnavailableRuntime
+    else DbWorkflowRuntime(dbConfig.copy(retryBackoff = retryBackoff))
 
   // DB-only: lock expiry, takeover and renewal need real lock timeouts.
   private lazy val shortLockRuntime: WorkflowRuntime = DbWorkflowRuntime(dbConfig.copy(lockTimeout = 2.seconds))
@@ -212,5 +222,29 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     }
     runner.join()
     assertEquals(result.get().get, 15)
+  }
+
+  test("A worker picks up a run that stopped making progress once its lock expired") {
+    given WorkflowRuntime = shortLockRuntime
+    val calls = AtomicInteger(0)
+
+    val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a12"]("stalled run")[Unit, Int] { _ =>
+      Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a13", 0]() {
+        if (calls.incrementAndGet() == 1) Thread.sleep(4000) // a stalled (or, in production, dead) run
+        calls.get()
+      }
+    }
+
+    val worker = WorkflowWorker(Seq(workflow))
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    val stalled = thread { Try(workflow.recover(instanceId)); () }
+    Thread.sleep(500)
+    assertEquals(worker.runOnce(), 0) // the running root's wakeup is postponed by the lock timeout
+    Thread.sleep(2000)
+    assertEquals(worker.runOnce(), 1) // lock expired: the worker takes over and completes the run
+    assertEquals(workflow.recover(instanceId), 2)
+    stalled.join()
   }
 }

@@ -12,6 +12,9 @@ import scala.concurrent.duration.DurationInt
 abstract class WorkflowRuntimeSuite extends FunSuite {
   def createWorkflowRuntime: WorkflowRuntime
 
+  /** A separate runtime whose failed runs are retried after the given base backoff. */
+  def createWorkflowRuntime(retryBackoff: scala.concurrent.duration.FiniteDuration): WorkflowRuntime
+
   given WorkflowRuntime = createWorkflowRuntime
 
   // Business keys derive deterministic instance ids; persistent runtimes keep them across suite runs.
@@ -646,6 +649,101 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val instanceId = WorkflowInstanceId.generate
     assertEquals(workflow.run(instanceId), ("cached", "once"))
     assertEquals(workflow.run(instanceId), ("cached", "once"))
+  }
+
+  test("A worker drives a workflow tree via wakeups, without manual recover") {
+    val requests = AtomicInteger(0)
+    val validated = Signal[String](SignalId("9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a01"))
+
+    val child = Workflow["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a02"]("worker child")[String, String] { (item: String) =>
+      Step.awaiting["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a03"](validated, "item" -> item) {
+        requests.incrementAndGet()
+      }
+    }
+
+    val root = Workflow["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a04"]("worker root")[Unit, List[String]] { _ =>
+      val results = List("a", "b").map(item => Workflow.orPending(child.runChild(item, item)))
+      results.collectFirst { case Left(pending) => pending }.foreach(Workflow.pending)
+      results.collect { case Right(value) => value }
+    }
+
+    val worker = WorkflowWorker(Seq(root))
+    val rootId = WorkflowInstanceId.generate
+
+    root.create(rootId)
+    assertEquals(worker.runOnce(), 1) // creation woke the root: both children request validation
+    assertEquals(requests.get(), 2)
+    assertEquals(worker.runOnce(), 0) // pending: nothing is due
+
+    // A signal on a child wakes the root of its tree
+    child.setSignal(child.childInstanceId(rootId, "a"), validated, "A")
+    assertEquals(worker.runOnce(), 1)
+    assertEquals(worker.runOnce(), 0)
+
+    child.setSignal(child.childInstanceId(rootId, "b"), validated, "B")
+    assertEquals(worker.runOnce(), 1)
+    assertEquals(worker.runOnce(), 0) // completed
+
+    assertEquals(root.recover(rootId), List("A", "B"))
+    assertEquals(requests.get(), 2)
+  }
+
+  test("A signal set while a run is in progress triggers another pass") {
+    val inside = new java.util.concurrent.CountDownLatch(1)
+    val release = new java.util.concurrent.CountDownLatch(1)
+    val signal = Signal[String](SignalId("9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a05"))
+
+    val workflow = Workflow["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a06"]("mid-run signal")[Unit, Unit] { _ =>
+      Step.cached["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a07", 0]() {
+        inside.countDown()
+        release.await()
+        "done"
+      }
+      ()
+    }
+
+    val worker = WorkflowWorker(Seq(workflow))
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    val runner = new Thread(() => { worker.runOnce(); () })
+    runner.start()
+    inside.await()
+    workflow.setSignal(instanceId, signal, "v")
+    release.countDown()
+    runner.join()
+
+    assertEquals(worker.runOnce(), 1) // the signal's wakeup survived the end of the in-flight run
+    assertEquals(worker.runOnce(), 0)
+  }
+
+  test("A worker retries failed runs with exponential backoff") {
+    given WorkflowRuntime = createWorkflowRuntime(retryBackoff = 500.millis)
+    val attempts = AtomicInteger(0)
+    val errors = AtomicInteger(0)
+
+    val workflow = Workflow["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a08"]("flaky")[Unit, Int] { _ =>
+      Step.cached["9e4f0a6b-2c3d-4e5f-9a0b-1c2d3e4f5a09", 0]() {
+        if (attempts.incrementAndGet() < 3) throw new RuntimeException("flaky")
+        attempts.get()
+      }
+    }
+
+    val worker = WorkflowWorker(Seq(workflow), onError = (_, _) => { errors.incrementAndGet(); () })
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    assertEquals(worker.runOnce(), 1) // fails: retry after 500ms
+    assertEquals(worker.runOnce(), 0)
+    Thread.sleep(700)
+    assertEquals(worker.runOnce(), 1) // fails again: retry after 1s
+    Thread.sleep(600)
+    assertEquals(worker.runOnce(), 0)
+    Thread.sleep(600)
+    assertEquals(worker.runOnce(), 1) // succeeds
+    assertEquals(worker.runOnce(), 0)
+    assertEquals(workflow.recover(instanceId), 3)
+    assertEquals(errors.get(), 2)
   }
 
   test("Concurrent runs of the same instance are mutually exclusive") {
