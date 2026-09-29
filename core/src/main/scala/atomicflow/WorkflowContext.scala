@@ -30,4 +30,8 @@ trait WorkflowContext {
   protected[atomicflow] def getSignalStore: SignalStore
 
   protected[atomicflow] def defaultCacheTtl: FiniteDuration
+
+  /** Called before any uncached (new) work in this instance. Runtimes use it to keep their execution lock alive and
+    * throw [[WorkflowError.Locked]] if it was lost, so a run that lost its lock never starts new work. */
+  protected[atomicflow] def checkpoint(): Unit = ()
 }

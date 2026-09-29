@@ -43,6 +43,7 @@ class CachedStepBuilder(id: StepId, version: Long) {
     cache.get(idempotencyId, inputFingerprints) match {
       case Some(value) => value
       case None =>
+        wfCtx.checkpoint()
         val result = body
         cache.put(idempotencyId, inputFingerprints, result, wfCtx.defaultCacheTtl)
         result
@@ -68,6 +69,7 @@ class OnlyOnceStepBuilder(id: StepId, version: Long) {
     cache.get(idempotencyId, inputFingerprints) match {
       case Some(value) => value
       case None =>
+        wfCtx.checkpoint()
         val result = body
         cache.put(idempotencyId, inputFingerprints, result, wfCtx.defaultCacheTtl)
         result

@@ -547,6 +547,44 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(counters, (1, 4, 4, 1, 3))
   }
 
+  test("Concurrent runs of the same instance are mutually exclusive") {
+    val running = AtomicInteger(0)
+    val maxRunning = AtomicInteger(0)
+
+    val workflow = Workflow["5b1f7c7e-8a33-4c1e-9d0e-3c7f4a2b9e01"]("exclusive workflow")[Unit, Unit] { _ =>
+      Step["5b1f7c7e-8a33-4c1e-9d0e-3c7f4a2b9e02", 0] {
+        maxRunning.accumulateAndGet(running.incrementAndGet(), math.max)
+        Thread.sleep(300)
+        running.decrementAndGet()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    workflow.create(instanceId)
+
+    val start = new java.util.concurrent.CountDownLatch(1)
+    val results = new java.util.concurrent.ConcurrentLinkedQueue[scala.util.Try[Unit]]()
+    val threads = (1 to 8).map { _ =>
+      val thread = new Thread(() => {
+        start.await()
+        results.add(scala.util.Try(workflow.recover(instanceId)))
+        ()
+      })
+      thread.start()
+      thread
+    }
+    start.countDown()
+    threads.foreach(_.join())
+
+    import scala.jdk.CollectionConverters.*
+    val all = results.asScala.toList
+    assertEquals(maxRunning.get(), 1)
+    assert(all.exists(_.isSuccess))
+    all.collect { case scala.util.Failure(e) => e }.foreach { e =>
+      assert(e.isInstanceOf[WorkflowError.Locked], s"unexpected failure: $e")
+    }
+  }
+
   test("Pending cannot be swallowed by Try or NonFatal catches") {
     val signal = Signal[String](SignalId("8d0b3f43-4f0b-4a4e-9a57-2b0f1f6f0a01"))
 

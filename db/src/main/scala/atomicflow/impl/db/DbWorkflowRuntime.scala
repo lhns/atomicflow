@@ -23,7 +23,11 @@ import java.util
 import java.util.UUID
 import scala.concurrent.duration.FiniteDuration
 
-class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
+class DbWorkflowRuntime[F[_] : Async](
+                                        xa: Transactor[F],
+                                        dispatcher: Dispatcher[F],
+                                        lockTimeout: FiniteDuration = DbWorkflowRuntime.defaultLockTimeout
+                                      ) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
   override def createWorkflowInstance[In: Cacheable, Out](
     workflow: Workflow[In, Out],
@@ -76,34 +80,18 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     defaultCacheTtl: FiniteDuration,
     stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
   ): Out = {
-    val lockDuration = java.time.Duration.ofMinutes(5)
-    val now = Instant.now()
-    val lockUntil = now.plus(lockDuration)
     val workflowMeta = workflow.meta
+    val lockToken = UUID.randomUUID()
 
-    runSync {
-      sql"SELECT id, locked_until FROM workflow_instance where id = $instanceId"
-        .query[(WorkflowInstanceId, Option[Instant])]
-        .option
-        .flatMap {
-          case None =>
-            throw WorkflowError.NotFound(
-              workflowMeta,
-              instanceId
-            )
-
-          case Some((_, Some(lockedUntil))) if now.isBefore(lockedUntil) =>
-            throw WorkflowError.Locked(
-              workflowMeta,
-              instanceId
-            )
-
-          case Some((_, _)) =>
-            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $instanceId"
-              .update
-              .run
-              .void
-        }
+    val input: Array[Byte] = runSync {
+      acquireLock(instanceId, lockToken).flatMap {
+        case Some(input) => Monad[ConnectionIO].pure(input)
+        case None =>
+          sql"SELECT 1 FROM workflow_instance WHERE id = $instanceId".query[Int].option.map {
+            case None => throw WorkflowError.NotFound(workflowMeta, instanceId)
+            case Some(_) => throw WorkflowError.Locked(workflowMeta, instanceId)
+          }
+      }
     }
 
     val _instanceId = instanceId
@@ -122,36 +110,59 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         new DbStepIdempotencyStore(stepScope, stepIdempotencyIdOverrides)
 
       override protected[atomicflow] def getStepCache[StepOut: Cacheable](stepScope: StepScope): StepCache[StepOut] =
-        new DbStepCache[StepOut](stepScope)
+        new DbStepCache[StepOut](stepScope, lockToken)
 
       override protected[atomicflow] def getSignalStore: SignalStore =
         DbSignalStore.bind(workflowScope)
 
       override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
         _defaultCacheTtl
+
+      @volatile private var lockRenewedAt: Long = System.nanoTime()
+
+      override protected[atomicflow] def checkpoint(): Unit =
+        if (System.nanoTime() - lockRenewedAt > lockTimeout.toNanos / 2) {
+          val renewedAt = System.nanoTime()
+          val renewed = runSync {
+            sql"""
+            UPDATE workflow_instance
+            SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds)
+            WHERE id = $_instanceId AND lock_owner = $lockToken
+            """.update.run
+          }
+          if (renewed == 0) throw WorkflowError.Locked(workflowMeta, _instanceId)
+          lockRenewedAt = renewedAt
+        }
     }
 
     try {
-      val inputBytes = runSync(loadInput(instanceId)).getOrElse {
-        throw WorkflowError.NotFound(
-          workflowMeta,
-          instanceId
-        )
-      }
-      workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
+      workflow.body(ctx, Cacheable[In].deserialize(input.asInstanceOf[IArray[Byte]]))
     } finally {
-      val unlock =
+      // Only release the lock if we still own it: after expiry another run may have taken it over.
+      runSync {
         sql"""
         UPDATE workflow_instance
-        SET locked_until = NULL
-        WHERE id = $instanceId
-      """.update.run
-      runSync(unlock)
+        SET locked_until = NULL, lock_owner = NULL
+        WHERE id = $instanceId AND lock_owner = $lockToken
+        """.update.run
+      }
     }
   }
 
-  private def loadInput(id: WorkflowInstanceId): ConnectionIO[Option[Array[Byte]]] =
-    sql"SELECT input FROM workflow_instance WHERE id = $id".query[Array[Byte]].option
+  private val lockTimeoutSeconds: Double = lockTimeout.toMillis / 1000.0
+
+  /** Atomically acquires the execution lock if it is free or expired; returns the instance input on success. */
+  private def acquireLock(instanceId: WorkflowInstanceId, lockToken: UUID): ConnectionIO[Option[Array[Byte]]] =
+    sql"""
+    UPDATE workflow_instance
+    SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds), lock_owner = $lockToken
+    WHERE id = $instanceId AND (locked_until IS NULL OR locked_until < now())
+    RETURNING input
+    """.query[Array[Byte]].option
+
+  /** Guards writes of step state: they only apply while the given lock token still owns the instance. */
+  private def ownsLock(instanceId: WorkflowInstanceId, lockToken: UUID): Fragment =
+    fr"EXISTS (SELECT 1 FROM workflow_instance WHERE id = $instanceId AND lock_owner = $lockToken)"
 
   class DbStepIdempotencyStore(
                                 stepScope: StepScope,
@@ -234,7 +245,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  class DbStepCache[Out: Cacheable](stepScope: StepScope) extends StepCache[Out] {
+  class DbStepCache[Out: Cacheable](stepScope: StepScope, lockToken: UUID) extends StepCache[Out] {
     override def get(
                       stepIdempotencyId: StepIdempotencyId,
                       inputFingerprints: StepInputFingerprints
@@ -267,15 +278,19 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       """.query[(Long, StepInputFingerprints)].option
 
       val query =
-        sql"""
+        (sql"""
         INSERT INTO step_cache (step_idempotency_id, step_id, step_version, input_fingerprints, output, expiry)
-        VALUES (${stepIdempotencyId}, ${stepScope.stepMeta.id}, ${stepScope.stepMeta.version}, $inputFingerprints, $data, $expiry)
+        SELECT ${stepIdempotencyId}, ${stepScope.stepMeta.id}, ${stepScope.stepMeta.version}, $inputFingerprints, $data, $expiry
+        WHERE """ ++ ownsLock(stepScope.workflowExecutionScope.workflowInstanceId, lockToken) ++ fr"""
         ON CONFLICT (step_idempotency_id) DO UPDATE
         SET step_version = ${stepScope.stepMeta.version},
             input_fingerprints = $inputFingerprints,
             output = $data,
             expiry = $expiry
-      """.update.run.void
+      """).update.run.map {
+          case 0 => throw WorkflowError.Locked(stepScope.workflowExecutionScope.workflowMeta, stepScope.workflowExecutionScope.workflowInstanceId)
+          case _ => ()
+        }
 
       runSync(existingQuery).foreach {
         case (existingVersion, existingFingerprints)
@@ -355,12 +370,17 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 }
 
 object DbWorkflowRuntime {
+  val defaultLockTimeout: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.MINUTES)
+
+  /** @param lockTimeout how long an execution lock stays valid without renewal. Runs renew it at every checkpoint
+    *                    (before new step work), so a single step body must finish within this timeout. */
   case class DbConfig(
                        driver: Option[String],
                        url: String,
                        user: String,
                        password: String,
-                       poolSize: Option[Int]
+                       poolSize: Option[Int],
+                       lockTimeout: FiniteDuration = defaultLockTimeout
                      ) {
     def driverOrDefault: String = driver.getOrElse("org.postgresql.Driver")
 
@@ -396,7 +416,7 @@ object DbWorkflowRuntime {
       dispatcher <- Dispatcher.parallel[IO]
       xa <- transactor(config)
     } yield
-      new DbWorkflowRuntime[IO](xa, dispatcher))
+      new DbWorkflowRuntime[IO](xa, dispatcher, config.lockTimeout))
       .allocated.map(_._1)
       .unsafeRunSync()(cats.effect.unsafe.IORuntime.global)
   }
