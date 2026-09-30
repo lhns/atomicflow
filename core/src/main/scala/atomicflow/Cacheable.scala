@@ -6,11 +6,26 @@ import cats.syntax.all.*
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import scala.collection.mutable.ListBuffer
+import scala.util.control.NonFatal
 
 trait Cacheable[A] {
   def serialize(value: A): IArray[Byte]
 
   def deserialize(bytes: IArray[Byte]): A
+
+  /** Evolves a cached format: serializes with this codec, but reads values written in an older format with
+    * `fallback` when this codec cannot read them, e.g. `newFormat.withFallback(oldFormat.imap(migrate)(unmigrate))`.
+    * Fallbacks can be chained for several generations. */
+  def withFallback(fallback: Cacheable[A]): Cacheable[A] = {
+    val primary = this
+    new Cacheable[A] {
+      override def serialize(value: A): IArray[Byte] = primary.serialize(value)
+
+      override def deserialize(bytes: IArray[Byte]): A =
+        try primary.deserialize(bytes)
+        catch case NonFatal(_) => fallback.deserialize(bytes)
+    }
+  }
 }
 
 object Cacheable {
