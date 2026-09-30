@@ -129,7 +129,8 @@ class InMemoryWorkflowRuntime(
                                              stepIdempotencyStore: WorkflowIdempotencyStore,
                                              rootWorkflowId: WorkflowId,
                                              rootInstanceId: WorkflowInstanceId,
-                                             versionAtCreation: Int
+                                             versionAtCreation: Int,
+                                             cancelRequested: AtomicBoolean = new AtomicBoolean(false)
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
@@ -234,6 +235,8 @@ class InMemoryWorkflowRuntime(
               override protected[atomicflow] val rootInstanceId: WorkflowInstanceId = state.rootInstanceId
 
               override protected[atomicflow] val versionAtCreation: Int = state.versionAtCreation
+
+              override protected[atomicflow] def isCancelRequested: Boolean = state.cancelRequested.get()
             }
             val result =
               try workflow.body(ctx, state.in)
@@ -348,6 +351,15 @@ class InMemoryWorkflowRuntime(
 
   override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
     wakeups.claim(workflowIds, limit)
+
+  override def cancelWorkflowInstance(workflowMeta: WorkflowMeta, instanceId: WorkflowInstanceId): Unit =
+    workflowInstances.get().get(instanceId) match {
+      case Some(state) =>
+        state.cancelRequested.set(true)
+        wakeups.schedule(state.rootWorkflowId, state.rootInstanceId, Instant.now(), claimedBy = None, resetAttempts = true, ifAbsent = false)
+      case None =>
+        throw WorkflowError.NotFound(workflowMeta, instanceId)
+    }
 
   override def scheduleWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit =
     wakeups.schedule(workflowId, instanceId, Instant.now().plusMillis(delay.toMillis), claimedBy = None, resetAttempts = false, ifAbsent = false)

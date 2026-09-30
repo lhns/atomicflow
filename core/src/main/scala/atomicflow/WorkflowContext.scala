@@ -42,7 +42,34 @@ trait WorkflowContext {
 
   protected[atomicflow] def rootInstanceId: WorkflowInstanceId
 
-  /** Called before any uncached (new) work in this instance. Runtimes use it to keep their execution lock alive and
-    * throw [[WorkflowError.Locked]] if it was lost, so a run that lost its lock never starts new work. */
-  protected[atomicflow] def checkpoint(): Unit = ()
+  /** Keeps this instance's execution lock alive; throws [[WorkflowError.Locked]] if it was lost. */
+  protected[atomicflow] def renewLock(): Unit = ()
+
+  /** Whether cancellation was requested for this instance (not considering ancestors). */
+  protected[atomicflow] def isCancelRequested: Boolean = false
+
+  /** Depth of nested `Workflow.uncancellable` regions in this instance. Workflow bodies run on a single thread. */
+  @volatile private[atomicflow] var uncancellableDepth: Int = 0
+
+  private[atomicflow] def isUncancellable: Boolean =
+    uncancellableDepth > 0 || parent.exists(_.isUncancellable)
+
+  private[atomicflow] def isCancelled: Boolean =
+    isCancelRequested || parent.exists(_.isCancelled)
+
+  private def renewLocks(): Unit = {
+    // A parent reaches no checkpoint of its own while its child runs inline.
+    parent.foreach(_.renewLocks())
+    renewLock()
+  }
+
+  /** Called before any uncached (new) work in this instance, never while replaying cached work:
+    *  - renews the execution locks of this instance and its ancestors, so a run that lost its lock never starts new
+    *    work ([[WorkflowError.Locked]]);
+    *  - throws [[WorkflowError.Cancelled]] if this instance or an ancestor was cancelled, unless inside
+    *    `Workflow.uncancellable`. Cancellation stays requested: it is raised again at every new checkpoint. */
+  protected[atomicflow] final def checkpoint(): Unit = {
+    renewLocks()
+    if (!isUncancellable && isCancelled) throw WorkflowError.Cancelled(meta, instanceId)
+  }
 }

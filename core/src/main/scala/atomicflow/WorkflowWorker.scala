@@ -27,6 +27,7 @@ class WorkflowWorker(
       try registry(wakeup.workflowId).recover(wakeup.instanceId)
       catch {
         case _: WorkflowError.SignalEmpty => // pending: woken up again when a signal is set
+        case _: WorkflowError.Cancelled => // cancelled and not compensated: finished
         case _: WorkflowError.Locked => rt.scheduleWakeup(wakeup.workflowId, wakeup.instanceId, lockedRetryDelay)
         case NonFatal(e) => onError(wakeup, e)
       }

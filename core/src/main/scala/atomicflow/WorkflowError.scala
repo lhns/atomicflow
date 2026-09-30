@@ -63,6 +63,16 @@ object WorkflowError {
     s"Step was started but its outcome is unknown: ${WorkflowErrorMessages.stepRef(stepMeta)}"
   ) with WorkflowError
 
+  /** Cancellation was requested for this instance or one of its ancestors (`Workflow.cancel`). Raised before new work
+    * starts, never while replaying cached work, and again at every new checkpoint until the workflow finishes.
+    * Catch it to compensate: wrap the compensating steps in `Workflow.uncancellable { ... }` and return normally. */
+  final case class Cancelled(
+                              workflowMeta: WorkflowMeta,
+                              workflowInstanceId: WorkflowInstanceId
+                            ) extends Exception(
+    s"Workflow instance was cancelled: ${WorkflowErrorMessages.workflowRef(workflowMeta, workflowInstanceId)}"
+  ) with WorkflowError
+
   /** The workflow is pending: it awaits a signal that is not set yet. Resume it with `recover()` once it is set.
     *
     * This is what callers of `run`/`create`/`recover` observe. Inside workflow bodies, pending travels as the internal

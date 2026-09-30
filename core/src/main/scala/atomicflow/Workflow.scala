@@ -45,6 +45,13 @@ case class Workflow[In: Cacheable, Out] private[atomicflow](
              )(using rt: WorkflowRuntime): Out =
     Workflow.unwrapPending(rt.recoverWorkflowInstance(this, instanceId, cacheTtl, stepIdempotencyIdOverrides, None))
 
+  /** Requests cancellation of an instance: from its next new step on, the instance and all its children raise
+    * [[WorkflowError.Cancelled]] (see there). Cancel the root of a tree: a parent that does not catch `Cancelled` around
+    * a cancelled child's `runChild` gets cancelled along with it. */
+  @throws[WorkflowError.NotFound]
+  def cancel(instanceId: WorkflowInstanceId)(using rt: WorkflowRuntime): Unit =
+    rt.cancelWorkflowInstance(meta, instanceId)
+
   @throws[WorkflowError.NotFound]
   @throws[WorkflowError.SignalConflict]
   def setSignal[A](
@@ -157,6 +164,14 @@ object Workflow {
     * Unlike `throw e`, business code catching `NonFatal` cannot swallow it. */
   def pending(e: WorkflowError.SignalEmpty): Nothing =
     throw PendingSignal(e)
+
+  /** Runs `body` without being interrupted by cancellation, e.g. compensating steps after catching
+    * [[WorkflowError.Cancelled]]. Applies to child runs started inside `body` as well. */
+  def uncancellable[R](body: => R)(using ctx: WorkflowContext): R = {
+    ctx.uncancellableDepth += 1
+    try body
+    finally ctx.uncancellableDepth -= 1
+  }
 
   /** The cache TTL of the current run (inherited by child runs). */
   def cacheTtl(using ctx: WorkflowContext): FiniteDuration =

@@ -64,6 +64,9 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
       unavailable
 
+    override def cancelWorkflowInstance(workflowMeta: WorkflowMeta, instanceId: WorkflowInstanceId): Unit =
+      unavailable
+
     override def scheduleWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit =
       unavailable
 

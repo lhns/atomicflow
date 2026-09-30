@@ -49,6 +49,11 @@ trait WorkflowRuntime {
     parent: Option[WorkflowContext]
   ): Out
 
+  /** Durably requests cancellation of an instance and wakes up its root.
+    * Cancellation is root-oriented: cancelling a root cancels its whole tree. */
+  @throws[WorkflowError.NotFound]
+  def cancelWorkflowInstance(workflowMeta: WorkflowMeta, instanceId: WorkflowInstanceId): Unit
+
   /** Claims up to `limit` due wakeups of root instances of the given workflows.
     * A claimed wakeup is postponed, so it fires again if the claimer dies before running the instance. */
   def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup]
@@ -74,11 +79,11 @@ object WorkflowRuntime {
   /** A root instance that is due to run. `attempts` counts consecutive failed runs. */
   case class Wakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, attempts: Int)
 
-  /** How a run ended, for wakeup bookkeeping: finished runs (completed or pending) need no further wakeup;
+  /** How a run ended, for wakeup bookkeeping: finished runs (completed, pending or cancelled) need no further wakeup;
     * failed runs are retried with exponential backoff. */
   private[atomicflow] def isFinished(outcome: Option[Throwable]): Boolean = outcome match {
     case None => true
-    case Some(_: PendingSignal | _: WorkflowError.SignalEmpty) => true
+    case Some(_: PendingSignal | _: WorkflowError.SignalEmpty | _: WorkflowError.Cancelled) => true
     case Some(_) => false
   }
 

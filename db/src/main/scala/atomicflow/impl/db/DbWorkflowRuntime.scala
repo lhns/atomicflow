@@ -144,13 +144,12 @@ class DbWorkflowRuntime[F[_] : Async](
 
       @volatile private var lockRenewedAt: Long = System.nanoTime()
 
-      // Also renews the ancestors' locks: a parent reaches no checkpoint of its own while its child runs inline.
-      override protected[atomicflow] def checkpoint(): Unit = {
-        _parent.foreach(_.checkpoint())
-        renewLockIfDue()
-      }
+      override protected[atomicflow] def isCancelRequested: Boolean =
+        runSync {
+          sql"SELECT cancel_requested_at IS NOT NULL FROM workflow_instance WHERE id = $_instanceId".query[Boolean].unique
+        }
 
-      private def renewLockIfDue(): Unit =
+      override protected[atomicflow] def renewLock(): Unit =
         if (System.nanoTime() - lockRenewedAt > lockTimeout.toNanos / 2) {
           val renewedAt = System.nanoTime()
           val renewed = runSync {
@@ -242,6 +241,18 @@ class DbWorkflowRuntime[F[_] : Async](
           claim_token = NULL
       WHERE root_instance_id = $instanceId AND claim_token = $lockToken
       """.update.run.void
+
+  override def cancelWorkflowInstance(workflowMeta: WorkflowMeta, instanceId: WorkflowInstanceId): Unit =
+    runSync {
+      sql"""
+      UPDATE workflow_instance
+      SET cancel_requested_at = COALESCE(cancel_requested_at, now())
+      WHERE id = $instanceId
+      """.update.run.flatMap {
+        case 0 => throw WorkflowError.NotFound(workflowMeta, instanceId)
+        case _ => wakeRoot(instanceId)
+      }
+    }
 
   override def claimWakeups(workflowIds: Set[WorkflowId], limit: Int): Seq[WorkflowRuntime.Wakeup] =
     if (workflowIds.isEmpty) Seq.empty

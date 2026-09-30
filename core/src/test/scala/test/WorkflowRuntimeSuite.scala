@@ -803,6 +803,90 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(sends.get(), 2)
   }
 
+  test("A cancelled workflow raises Cancelled before new work, but replays cached work") {
+    val prepared = AtomicInteger(0)
+    val signal = Signal[String](SignalId("3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d01"))
+
+    val workflow = Workflow["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d02"]("cancellable")[Unit, String] { _ =>
+      Step.cached["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d03", 0]() { prepared.incrementAndGet() }
+      signal.value
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    intercept[WorkflowError.SignalEmpty](workflow.run(instanceId))
+
+    workflow.cancel(instanceId)
+    workflow.setSignal(instanceId, signal, "too late")
+    // Replaying cached steps and reading signals is not new work: this run completes despite the cancellation...
+    assertEquals(workflow.recover(instanceId), "too late")
+    assertEquals(prepared.get(), 1)
+
+    // ...while a workflow that still has new work to do is stopped before it
+    val next = Workflow["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d04"]("cancellable with more work")[Unit, Int] { _ =>
+      val a = Step.cached["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d05", 0]() { prepared.incrementAndGet() }
+      signal.value
+      Step.cached["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d06", 0]() { prepared.incrementAndGet() }
+    }
+    val nextId = WorkflowInstanceId.generate
+    intercept[WorkflowError.SignalEmpty](next.run(nextId))
+    next.setSignal(nextId, signal, "v")
+    next.cancel(nextId)
+    intercept[WorkflowError.Cancelled](next.recover(nextId))
+    intercept[WorkflowError.Cancelled](next.recover(nextId)) // stays requested
+    assertEquals(prepared.get(), 2)
+  }
+
+  test("Cancellation can be compensated inside an uncancellable region") {
+    val requests = AtomicInteger(0)
+    val compensations = AtomicInteger(0)
+    val approval = Signal[String](SignalId("3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d07"))
+
+    val workflow = Workflow["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d08"]("compensating")[Unit, String] { _ =>
+      try {
+        Step.awaiting["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d09"](approval) { requests.incrementAndGet() }
+      } catch {
+        case _: WorkflowError.Cancelled =>
+          // Outside an uncancellable region, the compensation itself would be cancelled
+          intercept[WorkflowError.Cancelled] {
+            Step.onlyOnce["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d15"]() { compensations.incrementAndGet() }
+          }
+          Workflow.uncancellable {
+            Step.onlyOnce["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d10"]() { compensations.incrementAndGet() }
+          }
+          "withdrawn"
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    intercept[WorkflowError.SignalEmpty](workflow.run(instanceId))
+    workflow.cancel(instanceId)
+    assertEquals(workflow.recover(instanceId), "withdrawn")
+    assertEquals(workflow.recover(instanceId), "withdrawn")
+    assertEquals((requests.get(), compensations.get()), (1, 1))
+  }
+
+  test("Cancelling a root cancels its children, and wakes the root") {
+    val approval = Signal[String](SignalId("3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d11"))
+
+    val child = Workflow["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d12"]("cancelled child")[Unit, String] { _ =>
+      Step.awaiting["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d13"](approval) { () }
+    }
+    val root = Workflow["3d7b1f9e-5a2c-4e8d-b6f0-9c1e3a5b7d14"]("cancelled root")[Unit, String] { _ =>
+      child.runChild("c")
+    }
+
+    val worker = WorkflowWorker(Seq(root))
+    val rootId = WorkflowInstanceId.generate
+    root.create(rootId)
+    assertEquals(worker.runOnce(), 1) // pending on the child's approval
+    assertEquals(worker.runOnce(), 0)
+
+    root.cancel(rootId)
+    assertEquals(worker.runOnce(), 1) // woken up by the cancellation; the child raises Cancelled
+    assertEquals(worker.runOnce(), 0) // cancelled runs are finished, not retried
+    intercept[WorkflowError.Cancelled](root.recover(rootId))
+  }
+
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)
