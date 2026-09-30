@@ -277,7 +277,10 @@ attemptWorkflow.setSignal(attemptInstanceId, verdictSignal, "valid")  // wakes t
 ```
 
 - Children need no registration: they run inline in their root's pass.
-- Failed runs are retried with exponential backoff (`retryBackoff`, capped at one hour).
+- Failed runs are retried with exponential backoff (`retryBackoff`, capped at one hour) —
+  including failed direct `run`/`recover` calls of a root: a thrown run is not terminal.
+- Pass `onError` to observe failed runs; by default the worker stays silent (nothing is
+  lost, the runtime reschedules them).
 - A run interrupted by a dead process is retried once its lock has expired.
 - Several workers — also in different services with different registrations — can share
   one database; each only claims wakeups of its own workflows (`FOR UPDATE SKIP LOCKED`).
