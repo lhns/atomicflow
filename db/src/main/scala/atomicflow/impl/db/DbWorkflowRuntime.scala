@@ -309,20 +309,21 @@ class DbWorkflowRuntime[F[_] : Async](
       }
     }
 
-    override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
+    override def acquireOnlyOnceStepIdempotencyId(keyFingerprints: StepInputFingerprints): StepIdempotencyId = {
       val idQuery = sql"""
-        SELECT id FROM step_idempotency
+        SELECT id, input_fingerprints FROM step_idempotency
           WHERE workflow_id = ${stepScope.workflowExecutionScope.workflowMeta.id} AND
             workflow_instance_id = ${stepScope.workflowExecutionScope.workflowInstanceId} AND
               step_id = ${stepScope.stepMeta.id} AND
               is_only_once = true AND
               is_overridden = false
-      """.query[StepIdempotencyId].option
+          FOR UPDATE
+      """.query[(StepIdempotencyId, Option[StepInputFingerprints])].option
 
       def insertQuery(id: StepIdempotencyId) =
         sql"""
-          INSERT INTO step_idempotency (id, library_version, workflow_id, workflow_instance_id, step_id, is_only_once)
-          VALUES ($id, $libraryVersion, ${stepScope.workflowExecutionScope.workflowMeta.id}, ${stepScope.workflowExecutionScope.workflowInstanceId}, ${stepScope.stepMeta.id}, true)
+          INSERT INTO step_idempotency (id, library_version, workflow_id, workflow_instance_id, step_id, input_fingerprints, is_only_once)
+          VALUES ($id, $libraryVersion, ${stepScope.workflowExecutionScope.workflowMeta.id}, ${stepScope.workflowExecutionScope.workflowInstanceId}, ${stepScope.stepMeta.id}, $keyFingerprints, true)
           ON CONFLICT DO NOTHING
         """.update.run.as(id)
 
@@ -337,22 +338,26 @@ class DbWorkflowRuntime[F[_] : Async](
               is_overridden = false
         """.update.run.void
 
+      def newId(): StepIdempotencyId = StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
+
       runSync {
         idQuery.flatMap {
-          case Some(existing) =>
+          case Some((existing, recordedKeyFingerprints)) =>
             stepIdempotencyIdOverrides.get(stepScope.stepMeta.id) match {
               case Some(overrideId) if overrideId != existing =>
                 updateQuery >>
                   insertQuery(overrideId)
-              case _ =>
+              case Some(_) =>
+                Monad[ConnectionIO].pure(existing)
+              // rows from before drift policies have no recorded key fingerprints: nothing was invalidating
+              case None if recordedKeyFingerprints.getOrElse(StepInputFingerprints(Map.empty)) != keyFingerprints =>
+                updateQuery >>
+                  insertQuery(newId())
+              case None =>
                 Monad[ConnectionIO].pure(existing)
             }
           case None =>
-            val stepIdempotencyId = stepIdempotencyIdOverrides.getOrElse(
-              stepScope.stepMeta.id,
-              StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
-            )
-            insertQuery(stepIdempotencyId)
+            insertQuery(stepIdempotencyIdOverrides.getOrElse(stepScope.stepMeta.id, newId()))
         }
       }
     }

@@ -23,6 +23,9 @@ class InMemoryWorkflowRuntime(
 
     val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
+    /** The invalidating input fingerprints an at-most-once idempotency id was acquired with. */
+    val onceKeyFingerprints: AtomicReference[Map[StepIdempotencyId, StepInputFingerprints]] = new AtomicReference(Map.empty)
+
     def bind(
               stepScope: StepScope,
               stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
@@ -37,19 +40,26 @@ class InMemoryWorkflowRuntime(
         })(key)
       }
 
-      override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
+      override def acquireOnlyOnceStepIdempotencyId(keyFingerprints: StepInputFingerprints): StepIdempotencyId = {
         val key = OnceStepIdempotencyIdKey(stepScope.stepMeta.id)
         stepIdempotencyIdOverrides.get(stepScope.stepMeta.id) match {
           case Some(idempotencyId) =>
             idempotencyIds.updateAndGet(_ + (key -> idempotencyId))
+            onceKeyFingerprints.updateAndGet(_ + (idempotencyId -> keyFingerprints))
             idempotencyId
           case None =>
-            idempotencyIds.updateAndGet(ids => ids.get(key) match {
-              case Some(_) => ids
-              case None =>
-                val id = generateStepIdempotencyId
-                ids + (key -> id)
-            })(key)
+            synchronized {
+              idempotencyIds.get().get(key) match {
+                case Some(existing) if onceKeyFingerprints.get().getOrElse(existing, StepInputFingerprints(Map.empty)) == keyFingerprints =>
+                  existing
+                case _ =>
+                  // new, or an invalidating input changed: a new id makes the step run again
+                  val id = generateStepIdempotencyId
+                  idempotencyIds.updateAndGet(_ + (key -> id))
+                  onceKeyFingerprints.updateAndGet(_ + (id -> keyFingerprints))
+                  id
+              }
+            }
         }
       }
     }

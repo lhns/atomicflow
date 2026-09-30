@@ -762,6 +762,47 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(v2.run(WorkflowInstanceId.generate), "new path")
   }
 
+  test("A cached step's ensureUnchanged input conflicts instead of silently recomputing") {
+    val config = AtomicInteger(1)
+    val computations = AtomicInteger(0)
+
+    val workflow = Workflow["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c01"]("ensure unchanged")[String, Int] { (in: String) =>
+      val currentConfig = Step["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c02", 0] { config.get() } // not cached: may drift
+      Step.cached["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c03", 0]("in" -> in, ("config" -> currentConfig).ensureUnchanged) {
+        computations.incrementAndGet()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    assertEquals(workflow.run(instanceId, "a"), 1)
+    assertEquals(workflow.run(instanceId, "a"), 1)
+    config.set(2)
+    intercept[WorkflowError.StepConflict] {
+      workflow.run(instanceId, "a")
+    }
+    assertEquals(computations.get(), 1)
+  }
+
+  test("An onlyOnce step's invalidateOn input deliberately performs the side effect again when it changes") {
+    val content = new java.util.concurrent.atomic.AtomicReference("v1")
+    val sends = AtomicInteger(0)
+
+    val workflow = Workflow["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c04"]("invalidate on")[Unit, Int] { _ =>
+      val currentContent = Step["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c05", 0] { content.get() } // not cached: may drift
+      Step.onlyOnce["1f5a9c3e-7b2d-4f6a-8c0e-3b5d7f9a1c06"](("content" -> currentContent).invalidateOn) {
+        sends.incrementAndGet()
+      }
+    }
+
+    val instanceId = WorkflowInstanceId.generate
+    assertEquals(workflow.run(instanceId), 1)
+    assertEquals(workflow.run(instanceId), 1)
+    content.set("v2")
+    assertEquals(workflow.run(instanceId), 2) // re-sent because the content changed
+    assertEquals(workflow.run(instanceId), 2)
+    assertEquals(sends.get(), 2)
+  }
+
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)

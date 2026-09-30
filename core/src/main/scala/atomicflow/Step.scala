@@ -51,12 +51,26 @@ private[atomicflow] def fingerprints(inputs: Seq[StepInput[?]])(using wfCtx: Wor
   StepInputFingerprints(inputs.map(i => i.name -> i.fingerprint(fingerprinter)).toMap)
 }
 
-/** An at-least-once step: its result is cached per input, and it re-runs when its inputs or its version change. */
+/** The fingerprints of the inputs that identify a step execution, i.e. whose change re-runs the step. */
+private[atomicflow] def keyFingerprints(
+                                        inputs: Seq[StepInput[?]],
+                                        all: StepInputFingerprints,
+                                        default: InputPolicy
+                                      ): StepInputFingerprints = {
+  val keyNames = inputs.filter { input =>
+    (if (input.policy == InputPolicy.Default) default else input.policy) == InputPolicy.InvalidateOn
+  }.map(_.name).toSet
+  StepInputFingerprints(all.fingerprints.filter { case (name, _) => keyNames.contains(name) })
+}
+
+/** An at-least-once step: its result is cached per input, and it re-runs when its inputs or its version change.
+  * Inputs marked `.ensureUnchanged` instead raise [[WorkflowError.StepConflict]] when they change. */
 class CachedStepBuilder(id: StepId, version: Long) {
   def apply[Out: Cacheable](inputs: StepInput[?]*)(body: => Out)(using wfCtx: WorkflowContext): Out = {
     val scope = stepScope(id, version)
     val inputFingerprints = fingerprints(inputs)
-    val idempotencyId = wfCtx.getStepIdempotencyStore(scope).acquireStepIdempotencyId(inputFingerprints)
+    val idempotencyId = wfCtx.getStepIdempotencyStore(scope)
+      .acquireStepIdempotencyId(keyFingerprints(inputs, inputFingerprints, InputPolicy.InvalidateOn))
     val cache = wfCtx.getStepCache[Out](scope)
     cache.get(idempotencyId, inputFingerprints) match {
       case StepState.Completed(value) => value
@@ -80,7 +94,10 @@ object OnlyOnceStepBuilder {
   *    [[WorkflowError.StepUnknownState]] until an operator overrides the step's idempotency id.
   *
   * By default every exception is considered retryable. Use [[strict]] when an exception may occur after the side
-  * effect already happened (e.g. a read timeout), or [[retryIf]] to classify exceptions. */
+  * effect already happened (e.g. a read timeout), or [[retryIf]] to classify exceptions.
+  *
+  * Inputs must stay unchanged by default ([[WorkflowError.StepConflict]] otherwise). Inputs marked `.invalidateOn`
+  * deliberately perform the side effect again when they change. */
 class OnlyOnceStepBuilder(id: StepId, shouldRetry: Throwable => Boolean) {
   /** Only exceptions matching `predicate` count as "the side effect did not happen". */
   def retryIf(predicate: Throwable => Boolean): OnlyOnceStepBuilder =
@@ -93,7 +110,8 @@ class OnlyOnceStepBuilder(id: StepId, shouldRetry: Throwable => Boolean) {
   def apply[Out: Cacheable](inputs: StepInput[?]*)(body: => Out)(using wfCtx: WorkflowContext): Out = {
     val scope = stepScope(id, 0L)
     val inputFingerprints = fingerprints(inputs)
-    val idempotencyId = wfCtx.getStepIdempotencyStore(scope).acquireOnlyOnceStepIdempotencyId()
+    val idempotencyId = wfCtx.getStepIdempotencyStore(scope)
+      .acquireOnlyOnceStepIdempotencyId(keyFingerprints(inputs, inputFingerprints, InputPolicy.EnsureUnchanged))
     val cache = wfCtx.getStepCache[Out](scope)
     cache.get(idempotencyId, inputFingerprints) match {
       case StepState.Completed(value) => value
@@ -122,7 +140,11 @@ class OnlyOnceStepBuilder(id: StepId, shouldRetry: Throwable => Boolean) {
 /** Awaiting step: runs `initiate` exactly once (like [[Step.onlyOnce]]), then reads `signal`.
   * If the signal is unset, the run aborts pending ([[WorkflowError.SignalEmpty]]) and
   * a later `recover()` resumes it. Once the signal is observed, its value is captured in the
-  * step cache so completed replays no longer depend on the signal row. */
+  * step cache so completed replays no longer depend on the signal row.
+  *
+  * The inputs apply to both halves with their defaults: a drifting input conflicts on `initiate` (at-most-once) and
+  * re-reads the signal for the capture (cached). With inputs that are stable per instance, e.g. a per-attempt child
+  * keyed by a business id, neither happens. */
 class AwaitingStepBuilder(id: StepId, shouldRetry: Throwable => Boolean) {
   private val captureStepId: StepId = StepId.unsafeMake(
     java.util.UUID.nameUUIDFromBytes(s"${StepId.unwrap(id)}/awaiting".getBytes("UTF-8")).toString
