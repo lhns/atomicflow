@@ -1,6 +1,6 @@
 package test
 
-// Runnable example for the file-validation use-case (intentionally untracked, do not commit).
+// Runnable example for the file-validation use-case.
 // Run with: sbt "core/Test/runMain test.FileValidationExample"
 //
 // Demonstrates:
@@ -9,6 +9,7 @@ package test
 //  - a retry loop keyed by domain identity: the corrected revision id keys the next attempt
 //  - external actors addressing child instances via Workflow.childInstanceId
 //  - pending children not blocking siblings via Workflow.orPending
+//  - a WorkflowWorker driving the scan via wakeups instead of polling
 
 import atomicflow.{*, given}
 import atomicflow.Cacheable.Simple.given
@@ -127,12 +128,21 @@ object FileValidationExample {
     })
     operator.start()
 
-    // The driver: keeps recovering the scan until every file completed.
-    // In production this would be a crash-loop / scheduler calling recover().
+    // The worker runs the scan whenever it is woken up: on creation and whenever the operator sets a signal
+    // anywhere in its tree. Only the root workflow is registered; children run inline in the root's pass.
+    val worker = WorkflowWorker(
+      Seq(allFilesWorkflow),
+      onError = (wakeup, error) => println(s"[worker] run of ${wakeup.instanceId} failed, retrying later: $error")
+    )
+    val running = worker.start(pollInterval = 100.millis)
+
     println(s"[driver] starting scan $scanKey")
     allFilesWorkflow.create(rootId, ())
-    allFilesWorkflow.recoverUntilComplete(rootId, pollInterval = 200.millis)
     operator.join()
+
+    // Wait until the worker completed the scan
+    while (scala.util.Try(allFilesWorkflow.recover(rootId)).isFailure) Thread.sleep(100)
+    running.close()
     println("[driver] scan complete — all files processed")
 
     // Replay after completion: everything comes from the cache, no service calls run again.

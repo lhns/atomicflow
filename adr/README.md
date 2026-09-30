@@ -11,6 +11,7 @@ This directory captures architecture decisions for AtomicFlow.
 2. [0002 Idempotency and Replay Model](0002-idempotency-and-replay-model.md)
 3. [0003 Consistency and Error Semantics](0003-consistency-and-error-semantics.md)
 4. [0004 Runtime and Operational Model](0004-runtime-and-operational-model.md)
+5. [0005 Review Fixes and Ideas Adopted from the tschuchortdev Fork](0005-review-fixes-and-fork-ideas.md)
 
 ## How to Read
 - Read in order: each ADR builds on invariants from the previous one.
@@ -21,12 +22,16 @@ This directory captures architecture decisions for AtomicFlow.
 - 0002 defines replay and idempotency semantics on top of 0001.
 - 0003 defines consistency/error semantics across execution + replay.
 - 0004 defines backend and operational behavior that implements 0001-0003.
+- 0005 revises 0002-0004: at-most-once semantics, the sealed error type, the execution lock, wakeups and cancellation.
 
 ```mermaid
 flowchart LR
 	A[0001 Workflow Execution Model] --> B[0002 Idempotency and Replay Model]
 	B --> C[0003 Consistency and Error Semantics]
 	C --> D[0004 Runtime and Operational Model]
+	B --> E[0005 Review Fixes and Fork Ideas]
+	C --> E
+	D --> E
 ```
 
 ## API Maturity Assessment (2026-03-06)
