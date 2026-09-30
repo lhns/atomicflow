@@ -394,6 +394,11 @@ try {
 - **Only-Once Override**: Pass `stepIdempotencyIdOverrides` to `run`/`recover` when an only-once step intentionally needs a new idempotency identity.
 - **Execution lock**: runs of one instance are mutually exclusive. The DB runtime's lock (`DbConfig.lockTimeout`) is renewed between steps, and step results are only written while the run still owns it.
 - **Retry backoff**: `DbConfig.retryBackoff` / `InMemoryWorkflowRuntime(retryBackoff)` sets the base delay for retrying failed runs.
+- **Clock**: lock expiry, wakeups and retries use the database's time by default (`DbConfig.clock = None`), or an
+  injected `java.time.Clock` (`InMemoryWorkflowRuntime(clock = …)`). Tests advance a controllable clock instead of
+  waiting.
+- **Lifecycle**: `DbWorkflowRuntime.resource(config)` / `allocate(config)` close the connection pool when released;
+  `DbWorkflowRuntime(config)` keeps it for the lifetime of the JVM.
 - **Polling Drivers**: `runUntilComplete`/`recoverUntilComplete` block and re-recover on an interval until no signal is missing; prefer a `WorkflowWorker`.
 
 ---

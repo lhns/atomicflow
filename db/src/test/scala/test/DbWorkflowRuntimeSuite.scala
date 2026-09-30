@@ -25,8 +25,23 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     url = sys.env("DB_URL"),
     user = sys.env("DB_USERNAME"),
     password = sys.env("DB_PASSWORD"),
-    poolSize = None
+    poolSize = Some(8)
   )
+
+  // Every runtime holds a connection pool: close them all after the suite, so it can run repeatedly in one JVM.
+  private val releases = new java.util.concurrent.ConcurrentLinkedQueue[() => Unit]()
+
+  private def dbRuntime(config: DbConfig): WorkflowRuntime = {
+    val (runtime, release) = DbWorkflowRuntime.allocate(config)
+    releases.add(release)
+    runtime
+  }
+
+  override def afterAll(): Unit = {
+    import scala.jdk.CollectionConverters.*
+    releases.asScala.foreach(release => release())
+    super.afterAll()
+  }
 
   private object UnavailableRuntime extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
     private def unavailable[A]: A =
@@ -82,14 +97,22 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
 
   override def createWorkflowRuntime: WorkflowRuntime =
     if (missingDbVars.nonEmpty) UnavailableRuntime
-    else DbWorkflowRuntime(dbConfig)
+    else dbRuntime(dbConfig)
 
-  override def createWorkflowRuntime(retryBackoff: FiniteDuration): WorkflowRuntime =
+  override def createWorkflowRuntime(clock: TestClock, retryBackoff: FiniteDuration): WorkflowRuntime =
     if (missingDbVars.nonEmpty) UnavailableRuntime
-    else DbWorkflowRuntime(dbConfig.copy(retryBackoff = retryBackoff))
+    else dbRuntime(dbConfig.copy(retryBackoff = retryBackoff, clock = Some(clock), poolSize = Some(4)))
 
-  // DB-only: lock expiry, takeover and renewal need real lock timeouts.
-  private lazy val shortLockRuntime: WorkflowRuntime = DbWorkflowRuntime(dbConfig.copy(lockTimeout = 2.seconds))
+  // DB-only: lock expiry, takeover and renewal. Time only moves when a test advances the clock; threads are
+  // coordinated with latches.
+  private val lockTimeout = 2.seconds
+
+  // Shared by the lock tests (each runtime holds its own connection pool); every test only depends on time relative
+  // to its own start, so they can share one clock.
+  private lazy val clock = TestClock()
+
+  private lazy val clockedRuntime: WorkflowRuntime =
+    dbRuntime(dbConfig.copy(lockTimeout = lockTimeout, clock = Some(clock), poolSize = Some(4)))
 
   private def thread(body: => Unit): Thread = {
     val t = new Thread(() => body)
@@ -98,21 +121,26 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
   }
 
   test("An expired lock can be taken over; the previous owner can neither write step results nor release it") {
-    given WorkflowRuntime = shortLockRuntime
+    given WorkflowRuntime = clockedRuntime
     val bodyCalls = AtomicInteger(0)
+    val aInFirstStep = new CountDownLatch(1)
+    val aRelease = new CountDownLatch(1)
     val bInSecondStep = new CountDownLatch(1)
     val bRelease = new CountDownLatch(1)
 
     val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a01"]("lock takeover")[Unit, Int] { _ =>
       val a = Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a02", 0]() {
         val call = bodyCalls.incrementAndGet()
-        if (call == 1) Thread.sleep(3000) // run A outlives its 2s lock without reaching a checkpoint
+        if (call == 1) {
+          aInFirstStep.countDown()
+          awaitLatch(aRelease) // run A stays in its step body, without reaching a checkpoint
+        }
         call
       }
       Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a03", 0]("a" -> a) {
         if (a == 2) {
           bInSecondStep.countDown()
-          bRelease.await()
+          awaitLatch(bRelease)
         }
         a
       }
@@ -124,10 +152,12 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     val resultA = AtomicReference[Try[Int]]()
     val resultB = AtomicReference[Try[Int]]()
     val threadA = thread(resultA.set(Try(workflow.recover(instanceId))))
-    Thread.sleep(2300)
+    awaitLatch(aInFirstStep)
+    clock.advance(lockTimeout + 1.second) // A's lock expires
     val threadB = thread(resultB.set(Try(workflow.recover(instanceId))))
-    assert(bInSecondStep.await(5, java.util.concurrent.TimeUnit.SECONDS), "run B did not take over the expired lock")
+    awaitLatch(bInSecondStep) // B took over the expired lock
 
+    aRelease.countDown()
     threadA.join()
     assert(resultA.get().failed.toOption.exists(_.isInstanceOf[WorkflowError.Locked]), s"run A: ${resultA.get()}")
 
@@ -143,16 +173,26 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     assertEquals(bodyCalls.get(), 2)
   }
 
+  /** Five steps that each take 35% of the lock timeout; the first run to reach the last one blocks until released. */
+  private def slowSteps(clock: TestClock, inLastStep: CountDownLatch, release: CountDownLatch)(using WorkflowContext): Int =
+    (1 to 5).map { i =>
+      Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a05", 0]("i" -> i) {
+        clock.advance(lockTimeout * 35 / 100)
+        if (i == 5 && inLastStep.getCount > 0) {
+          inLastStep.countDown()
+          awaitLatch(release)
+        }
+        i
+      }
+    }.sum
+
   test("A running instance renews its lock at checkpoints") {
-    given WorkflowRuntime = shortLockRuntime
+    given WorkflowRuntime = clockedRuntime
+    val inLastStep = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
 
     val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a04"]("lock renewal")[Unit, Int] { _ =>
-      (1 to 5).map { i =>
-        Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a05", 0]("i" -> i) {
-          Thread.sleep(700)
-          i
-        }
-      }.sum
+      slowSteps(clock, inLastStep, release)
     }
 
     val instanceId = WorkflowInstanceId.generate
@@ -160,22 +200,26 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
 
     val result = AtomicReference[Try[Int]]()
     val runner = thread(result.set(Try(workflow.recover(instanceId))))
-    Thread.sleep(2600) // past the initial 2s lock
+    awaitLatch(inLastStep) // 175% of the initial lock timeout has passed
     intercept[WorkflowError.Locked] {
       workflow.recover(instanceId)
     }
+    release.countDown()
     runner.join()
     assertEquals(result.get().get, 15)
   }
 
   test("After a lost lock, an in-flight onlyOnce step is reported as unknown instead of running twice") {
-    given WorkflowRuntime = shortLockRuntime
+    given WorkflowRuntime = clockedRuntime
     val effects = AtomicInteger(0)
+    val inside = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
 
     val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a06"]("lock takeover once")[Unit, Int] { _ =>
       Step.onlyOnce["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a07"]() {
         effects.incrementAndGet()
-        Thread.sleep(3000) // outlives the 2s lock
+        inside.countDown()
+        awaitLatch(release)
         1
       }
     }
@@ -185,25 +229,24 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
 
     val resultA = AtomicReference[Try[Int]]()
     val threadA = thread(resultA.set(Try(workflow.recover(instanceId))))
-    Thread.sleep(2300)
+    awaitLatch(inside)
+    clock.advance(lockTimeout + 1.second) // A's lock expires mid-step
     intercept[WorkflowError.StepUnknownState] {
       workflow.recover(instanceId)
     }
+    release.countDown()
     threadA.join()
     assert(resultA.get().failed.toOption.exists(_.isInstanceOf[WorkflowError.Locked]), s"run A: ${resultA.get()}")
     assertEquals(effects.get(), 1)
   }
 
   test("A child running inline keeps its ancestors' locks alive") {
-    given WorkflowRuntime = shortLockRuntime
+    given WorkflowRuntime = clockedRuntime
+    val inLastStep = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
 
     val child = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a08"]("long child")[Unit, Int] { _ =>
-      (1 to 5).map { i =>
-        Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a09", 0]("i" -> i) {
-          Thread.sleep(700)
-          i
-        }
-      }.sum
+      slowSteps(clock, inLastStep, release)
     }
 
     val parent = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a10"]("parent of long child")[Unit, Int] { _ =>
@@ -219,21 +262,27 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
 
     val result = AtomicReference[Try[Int]]()
     val runner = thread(result.set(Try(parent.recover(parentId))))
-    Thread.sleep(2600) // past the parent's initial 2s lock, while the child is still running
+    awaitLatch(inLastStep) // past the parent's initial lock timeout, while the child is still running
     intercept[WorkflowError.Locked] {
       parent.recover(parentId)
     }
+    release.countDown()
     runner.join()
     assertEquals(result.get().get, 15)
   }
 
   test("A worker picks up a run that stopped making progress once its lock expired") {
-    given WorkflowRuntime = shortLockRuntime
+    given WorkflowRuntime = clockedRuntime
     val calls = AtomicInteger(0)
+    val stalled = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
 
     val workflow = Workflow["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a12"]("stalled run")[Unit, Int] { _ =>
       Step.cached["c3a1e0d2-6f4b-4d8e-9b1a-7e2c5f3d0a13", 0]() {
-        if (calls.incrementAndGet() == 1) Thread.sleep(4000) // a stalled (or, in production, dead) run
+        if (calls.incrementAndGet() == 1) {
+          stalled.countDown()
+          awaitLatch(release) // a stalled (or, in production, dead) run
+        }
         calls.get()
       }
     }
@@ -242,12 +291,13 @@ class DbWorkflowRuntimeSuite extends WorkflowRuntimeSuite {
     val instanceId = WorkflowInstanceId.generate
     workflow.create(instanceId)
 
-    val stalled = thread { Try(workflow.recover(instanceId)); () }
-    Thread.sleep(500)
+    val stalledRun = thread { Try(workflow.recover(instanceId)); () }
+    awaitLatch(stalled)
     assertEquals(worker.runOnce(), 0) // the running root's wakeup is postponed by the lock timeout
-    Thread.sleep(2000)
+    clock.advance(lockTimeout + 1.second)
     assertEquals(worker.runOnce(), 1) // lock expired: the worker takes over and completes the run
     assertEquals(workflow.recover(instanceId), 2)
-    stalled.join()
+    release.countDown()
+    stalledRun.join()
   }
 }

@@ -18,7 +18,7 @@ import doobie.implicits.*
 import doobie.postgres.circe.jsonb.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.Instant
+import java.time.{Clock, Instant}
 import java.util
 import java.util.UUID
 import scala.concurrent.duration.FiniteDuration
@@ -27,8 +27,18 @@ class DbWorkflowRuntime[F[_] : Async](
                                         xa: Transactor[F],
                                         dispatcher: Dispatcher[F],
                                         lockTimeout: FiniteDuration = DbWorkflowRuntime.defaultLockTimeout,
-                                        retryBackoff: FiniteDuration = DbWorkflowRuntime.defaultRetryBackoff
+                                        retryBackoff: FiniteDuration = DbWorkflowRuntime.defaultRetryBackoff,
+                                        clock: Option[Clock] = None
                                       ) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
+
+  /** The current time for all time-based decisions (lock expiry, wakeups, retries), inlined into queries: the
+    * database's time by default, so decisions do not depend on each node's clock, or the injected clock (e.g. a
+    * controllable test clock). */
+  private def now: Fragment =
+    clock.fold(fr0"now()")(clock => fr0"${Instant.now(clock)}::timestamptz")
+
+  private def currentInstant: Instant =
+    clock.fold(Instant.now())(Instant.now(_))
 
   override def createWorkflowInstance[In: Cacheable, Out](
     workflow: Workflow[In, Out],
@@ -142,7 +152,7 @@ class DbWorkflowRuntime[F[_] : Async](
 
       override protected[atomicflow] val versionAtCreation: Int = storedVersion
 
-      @volatile private var lockRenewedAt: Long = System.nanoTime()
+      @volatile private var lockRenewedAt: Instant = currentInstant
 
       override protected[atomicflow] def isCancelRequested: Boolean =
         runSync {
@@ -150,12 +160,12 @@ class DbWorkflowRuntime[F[_] : Async](
         }
 
       override protected[atomicflow] def renewLock(): Unit =
-        if (System.nanoTime() - lockRenewedAt > lockTimeout.toNanos / 2) {
-          val renewedAt = System.nanoTime()
+        if (currentInstant.isAfter(lockRenewedAt.plusMillis(lockTimeout.toMillis / 2))) {
+          val renewedAt = currentInstant
           val renewed = runSync {
             sql"""
             UPDATE workflow_instance
-            SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds)
+            SET locked_until = $now + make_interval(secs => $lockTimeoutSeconds)
             WHERE id = $_instanceId AND lock_owner = $lockToken
             """.update.run
           }
@@ -201,8 +211,8 @@ class DbWorkflowRuntime[F[_] : Async](
                          ): ConnectionIO[Option[Acquired]] =
     sql"""
     UPDATE workflow_instance
-    SET locked_until = now() + make_interval(secs => $lockTimeoutSeconds), lock_owner = $lockToken
-    WHERE id = $instanceId AND (locked_until IS NULL OR locked_until < now())
+    SET locked_until = $now + make_interval(secs => $lockTimeoutSeconds), lock_owner = $lockToken
+    WHERE id = $instanceId AND (locked_until IS NULL OR locked_until < $now)
     RETURNING input, root_workflow_id, root_instance_id, workflow_version
     """.query[(Array[Byte], Option[WorkflowId], Option[WorkflowInstanceId], Int)].option.map(_.map {
       case (input, rootWorkflowId, rootInstanceId, version) => Acquired(input, rootWorkflowId.zip(rootInstanceId), version)
@@ -215,15 +225,15 @@ class DbWorkflowRuntime[F[_] : Async](
   private def scheduleWakeupNow(workflowId: WorkflowId, instanceId: WorkflowInstanceId, ifAbsent: Boolean): ConnectionIO[Unit] =
     (sql"""
     INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
-    VALUES ($instanceId, $workflowId, now(), 0, NULL)
+    VALUES ($instanceId, $workflowId, $now, 0, NULL)
     ON CONFLICT (root_instance_id) DO """ ++
-      (if (ifAbsent) fr"NOTHING" else fr"UPDATE SET scheduled_at = now(), attempts = 0, claim_token = NULL")
+      (if (ifAbsent) fr"NOTHING" else fr"UPDATE SET scheduled_at = $now, attempts = 0, claim_token = NULL")
       ).update.run.void
 
   private def claimOwnWakeup(workflowId: WorkflowId, instanceId: WorkflowInstanceId, lockToken: UUID): ConnectionIO[Unit] =
     sql"""
     INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
-    VALUES ($instanceId, $workflowId, now() + make_interval(secs => $lockTimeoutSeconds), 0, $lockToken)
+    VALUES ($instanceId, $workflowId, $now + make_interval(secs => $lockTimeoutSeconds), 0, $lockToken)
     ON CONFLICT (root_instance_id) DO UPDATE
     SET scheduled_at = EXCLUDED.scheduled_at, claim_token = EXCLUDED.claim_token
     """.update.run.void
@@ -236,7 +246,7 @@ class DbWorkflowRuntime[F[_] : Async](
     else
       sql"""
       UPDATE workflow_wakeup
-      SET scheduled_at = now() + make_interval(secs => LEAST($retryBackoffSeconds * power(2, LEAST(attempts, 30)), $maxRetryDelaySeconds)),
+      SET scheduled_at = $now + make_interval(secs => LEAST($retryBackoffSeconds * power(2, LEAST(attempts, 30)), $maxRetryDelaySeconds)),
           attempts = attempts + 1,
           claim_token = NULL
       WHERE root_instance_id = $instanceId AND claim_token = $lockToken
@@ -246,7 +256,7 @@ class DbWorkflowRuntime[F[_] : Async](
     runSync {
       sql"""
       UPDATE workflow_instance
-      SET cancel_requested_at = COALESCE(cancel_requested_at, now())
+      SET cancel_requested_at = COALESCE(cancel_requested_at, $now)
       WHERE id = $instanceId
       """.update.run.flatMap {
         case 0 => throw WorkflowError.NotFound(workflowMeta, instanceId)
@@ -261,10 +271,10 @@ class DbWorkflowRuntime[F[_] : Async](
       runSync {
         sql"""
         UPDATE workflow_wakeup
-        SET scheduled_at = now() + make_interval(secs => $lockTimeoutSeconds)
+        SET scheduled_at = $now + make_interval(secs => $lockTimeoutSeconds)
         WHERE root_instance_id IN (
           SELECT root_instance_id FROM workflow_wakeup
-          WHERE scheduled_at <= now() AND root_workflow_id = ANY($ids)
+          WHERE scheduled_at <= $now AND root_workflow_id = ANY($ids)
           ORDER BY scheduled_at
           LIMIT $limit
           FOR UPDATE SKIP LOCKED
@@ -278,7 +288,7 @@ class DbWorkflowRuntime[F[_] : Async](
     runSync {
       sql"""
       INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
-      VALUES ($instanceId, $workflowId, now() + make_interval(secs => ${delay.toMillis / 1000.0}), 0, NULL)
+      VALUES ($instanceId, $workflowId, $now + make_interval(secs => ${delay.toMillis / 1000.0}), 0, NULL)
       ON CONFLICT (root_instance_id) DO UPDATE
       SET scheduled_at = EXCLUDED.scheduled_at, claim_token = NULL
       """.update.run.void
@@ -427,7 +437,7 @@ class DbWorkflowRuntime[F[_] : Async](
                       value: Out,
                       ttl: FiniteDuration
                     ): Unit = {
-      val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
+      val expiry = currentInstant.plusMillis(ttl.toMillis)
       val data = Cacheable[Out].serialize(value).asInstanceOf[Array[Byte]]
 
       val query =
@@ -475,7 +485,7 @@ class DbWorkflowRuntime[F[_] : Async](
 
       @throws[WorkflowError.SignalConflict]
       override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration): Unit = {
-        val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
+        val expiry = currentInstant.plusMillis(ttl.toMillis)
         val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
 
         runSync {
@@ -516,10 +526,10 @@ class DbWorkflowRuntime[F[_] : Async](
   private def wakeRoot(instanceId: WorkflowInstanceId): ConnectionIO[Unit] =
     sql"""
     INSERT INTO workflow_wakeup (root_instance_id, root_workflow_id, scheduled_at, attempts, claim_token)
-    SELECT COALESCE(root_instance_id, id), COALESCE(root_workflow_id, workflow_id::uuid), now(), 0, NULL
+    SELECT COALESCE(root_instance_id, id), COALESCE(root_workflow_id, workflow_id::uuid), $now, 0, NULL
     FROM workflow_instance WHERE id = $instanceId
     ON CONFLICT (root_instance_id) DO UPDATE
-    SET scheduled_at = now(), attempts = 0, claim_token = NULL
+    SET scheduled_at = $now, attempts = 0, claim_token = NULL
     """.update.run.void
 
   private def runSync[A](fa: ConnectionIO[A]): A =
@@ -539,7 +549,8 @@ object DbWorkflowRuntime {
   val defaultRetryBackoff: FiniteDuration = FiniteDuration(5, java.util.concurrent.TimeUnit.SECONDS)
 
   /** @param lockTimeout how long an execution lock stays valid without renewal. Runs renew it at every checkpoint
-    *                    (before new step work), so a single step body must finish within this timeout. */
+    *                    (before new step work), so a single step body must finish within this timeout.
+    * @param clock       time source for locks, wakeups and retries; `None` uses the database's time. */
   case class DbConfig(
                        driver: Option[String],
                        url: String,
@@ -547,7 +558,8 @@ object DbWorkflowRuntime {
                        password: String,
                        poolSize: Option[Int],
                        lockTimeout: FiniteDuration = defaultLockTimeout,
-                       retryBackoff: FiniteDuration = defaultRetryBackoff
+                       retryBackoff: FiniteDuration = defaultRetryBackoff,
+                       clock: Option[Clock] = None
                      ) {
     def driverOrDefault: String = driver.getOrElse("org.postgresql.Driver")
 
@@ -578,15 +590,24 @@ object DbWorkflowRuntime {
       }
     } yield xa
 
-  def apply(config: DbConfig): WorkflowRuntime = {
-    (for {
+  /** The runtime as a resource: releasing it closes its connection pool. */
+  def resource(config: DbConfig): Resource[IO, WorkflowRuntime] =
+    for {
       dispatcher <- Dispatcher.parallel[IO]
       xa <- transactor(config)
     } yield
-      new DbWorkflowRuntime[IO](xa, dispatcher, config.lockTimeout, config.retryBackoff))
-      .allocated.map(_._1)
-      .unsafeRunSync()(cats.effect.unsafe.IORuntime.global)
+      new DbWorkflowRuntime[IO](xa, dispatcher, config.lockTimeout, config.retryBackoff, config.clock)
+
+  /** Creates a runtime, together with a function that closes its connection pool. */
+  def allocate(config: DbConfig): (WorkflowRuntime, () => Unit) = {
+    given cats.effect.unsafe.IORuntime = cats.effect.unsafe.IORuntime.global
+    val (runtime, release) = resource(config).allocated.unsafeRunSync()
+    (runtime, () => release.unsafeRunSync())
   }
+
+  /** Creates a runtime whose connection pool lives as long as the JVM. Use [[resource]] or [[allocate]] to close it. */
+  def apply(config: DbConfig): WorkflowRuntime =
+    allocate(config)._1
 
   given Meta[StepIdempotencyId] = Meta[UUID].imap(uuid =>
     StepIdempotencyId.unsafeMake(uuid.toString)

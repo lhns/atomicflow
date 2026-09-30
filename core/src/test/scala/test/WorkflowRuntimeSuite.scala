@@ -12,8 +12,14 @@ import scala.concurrent.duration.DurationInt
 abstract class WorkflowRuntimeSuite extends FunSuite {
   def createWorkflowRuntime: WorkflowRuntime
 
-  /** A separate runtime whose failed runs are retried after the given base backoff. */
-  def createWorkflowRuntime(retryBackoff: scala.concurrent.duration.FiniteDuration): WorkflowRuntime
+  /** A separate runtime driven by the given clock, whose failed runs are retried after the given base backoff. */
+  def createWorkflowRuntime(clock: TestClock, retryBackoff: scala.concurrent.duration.FiniteDuration): WorkflowRuntime
+
+  /** Waits for a latch. The timeout only guards against deadlocks; tests never rely on it elapsing.
+    * Deliberately not munit's `assert`: it evaluates its condition while holding a lock shared by all threads. */
+  protected def awaitLatch(latch: java.util.concurrent.CountDownLatch): Unit =
+    if (!latch.await(1, java.util.concurrent.TimeUnit.MINUTES))
+      throw new AssertionError("deadlock: latch was never released")
 
   given WorkflowRuntime = createWorkflowRuntime
 
@@ -315,20 +321,24 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   test("recoverUntilComplete should block until signal is set") {
     val signal = Signal[String](SignalId("d0e1f2a3-b4c5-6789-0123-def012345678"))
 
+    val pendingOnce = new java.util.concurrent.CountDownLatch(1)
+
     val workflow = Workflow["e1f2a3b4-c5d6-7890-1234-ef0123456789"]("signal recover")[Unit, String] { _ =>
+      if (signal.option.isEmpty) pendingOnce.countDown()
       signal.value
     }
 
     val instanceId = WorkflowInstanceId.generate
     workflow.create(instanceId)
 
+    // The signal is only set after recoverUntilComplete observed the instance pending at least once
     val thread = new Thread(() => {
-      Thread.sleep(300)
+      awaitLatch(pendingOnce)
       workflow.setSignal(instanceId, signal, "hello")
     })
     thread.start()
 
-    val result = workflow.recoverUntilComplete(instanceId, pollInterval = 100.millis)
+    val result = workflow.recoverUntilComplete(instanceId, pollInterval = 10.millis)
     assertEquals(result, "hello")
     thread.join()
   }
@@ -718,7 +728,8 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("A worker retries failed runs with exponential backoff") {
-    given WorkflowRuntime = createWorkflowRuntime(retryBackoff = 500.millis)
+    val clock = TestClock()
+    given WorkflowRuntime = createWorkflowRuntime(clock, retryBackoff = 10.seconds)
     val attempts = AtomicInteger(0)
     val errors = AtomicInteger(0)
 
@@ -733,13 +744,15 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val instanceId = WorkflowInstanceId.generate
     workflow.create(instanceId)
 
-    assertEquals(worker.runOnce(), 1) // fails: retry after 500ms
+    assertEquals(worker.runOnce(), 1) // fails: retry after 10s
     assertEquals(worker.runOnce(), 0)
-    Thread.sleep(700)
-    assertEquals(worker.runOnce(), 1) // fails again: retry after 1s
-    Thread.sleep(600)
+    clock.advance(9.seconds)
     assertEquals(worker.runOnce(), 0)
-    Thread.sleep(600)
+    clock.advance(1.second)
+    assertEquals(worker.runOnce(), 1) // fails again: retry after 20s
+    clock.advance(19.seconds)
+    assertEquals(worker.runOnce(), 0)
+    clock.advance(1.second)
     assertEquals(worker.runOnce(), 1) // succeeds
     assertEquals(worker.runOnce(), 0)
     assertEquals(workflow.recover(instanceId), 3)
@@ -890,11 +903,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   test("Concurrent runs of the same instance are mutually exclusive") {
     val running = AtomicInteger(0)
     val maxRunning = AtomicInteger(0)
+    val contenders = 8
+    // The run holding the lock only finishes once all other runs were locked out
+    val lockedOut = new java.util.concurrent.CountDownLatch(contenders - 1)
 
     val workflow = Workflow["5b1f7c7e-8a33-4c1e-9d0e-3c7f4a2b9e01"]("exclusive workflow")[Unit, Unit] { _ =>
       Step["5b1f7c7e-8a33-4c1e-9d0e-3c7f4a2b9e02", 0] {
         maxRunning.accumulateAndGet(running.incrementAndGet(), math.max)
-        Thread.sleep(300)
+        awaitLatch(lockedOut)
         running.decrementAndGet()
       }
     }
@@ -904,10 +920,12 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     val start = new java.util.concurrent.CountDownLatch(1)
     val results = new java.util.concurrent.ConcurrentLinkedQueue[scala.util.Try[Unit]]()
-    val threads = (1 to 8).map { _ =>
+    val threads = (1 to contenders).map { _ =>
       val thread = new Thread(() => {
         start.await()
-        results.add(scala.util.Try(workflow.recover(instanceId)))
+        val result = scala.util.Try(workflow.recover(instanceId))
+        if (result.failed.toOption.exists(_.isInstanceOf[WorkflowError.Locked])) lockedOut.countDown()
+        results.add(result)
         ()
       })
       thread.start()
@@ -919,7 +937,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     import scala.jdk.CollectionConverters.*
     val all = results.asScala.toList
     assertEquals(maxRunning.get(), 1)
-    assert(all.exists(_.isSuccess))
+    assertEquals(all.count(_.isSuccess), 1)
     all.collect { case scala.util.Failure(e) => e }.foreach { e =>
       assert(e.isInstanceOf[WorkflowError.Locked], s"unexpected failure: $e")
     }
