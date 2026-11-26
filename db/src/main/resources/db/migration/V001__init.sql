@@ -107,7 +107,7 @@ CREATE TABLE signal_cursor (
     ON DELETE CASCADE
 );
 
-CREATE TABLE workflow_signal_subscriptions (
+CREATE TABLE workflow_subscriptions (
   workflow_id VARCHAR NOT NULL,
   workflow_instance_key VARCHAR NOT NULL,
   workflow_instance_scope VARCHAR[] NOT NULL,
@@ -115,53 +115,37 @@ CREATE TABLE workflow_signal_subscriptions (
   step_scope_within_instance VARCHAR[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   subscriber_key VARCHAR NOT NULL,
-  signal_key VARCHAR NOT NULL,
+  kind VARCHAR NOT NULL CHECK (kind IN ('signal', 'timer', 'completion')),
+  signal_key VARCHAR,
+  timer_id UUID UNIQUE,
+  deadline TIMESTAMPTZ,
+  completed_workflow_id VARCHAR,
+  completed_workflow_instance_key VARCHAR,
+  completed_workflow_instance_scope VARCHAR[],
   PRIMARY KEY (
-    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, signal_key, step_scope_within_instance
+    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key
   ),
+  CHECK ((kind = 'signal') = (signal_key IS NOT NULL)),
+  CHECK ((kind = 'timer') = (timer_id IS NOT NULL AND deadline IS NOT NULL)),
+  CHECK ((kind = 'completion') = (
+    completed_workflow_id IS NOT NULL AND completed_workflow_instance_key IS NOT NULL AND completed_workflow_instance_scope IS NOT NULL)),
   FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
     REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
-CREATE TABLE workflow_timer_subscriptions (
-  timer_id UUID PRIMARY KEY,
-  workflow_id VARCHAR NOT NULL,
-  workflow_instance_key VARCHAR NOT NULL,
-  workflow_instance_scope VARCHAR[] NOT NULL,
-  step_id VARCHAR NOT NULL,
-  step_scope_within_instance VARCHAR[] NOT NULL DEFAULT '{}',
-  step_version BIGINT NOT NULL,
-  subscriber_key VARCHAR NOT NULL,
-  deadline TIMESTAMPTZ NOT NULL,
-  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
-    ON DELETE CASCADE,
-  UNIQUE (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance)
-);
+COMMENT ON TABLE workflow_subscriptions IS
+  'One row per pending await subscriber: the wait site (step id, scope, version) plus the subscriber key within it. kind selects the columns in use: signal_key for a signal, timer_id and the stored absolute deadline for a timer (timer_id is drawn per registration, so a re-registration after invalidation never matches an older TimerFired event), the completed_* identity for a workflow completion.';
 
-CREATE INDEX workflow_timer_subscriptions_deadline
-  ON workflow_timer_subscriptions (deadline);
+CREATE INDEX workflow_subscriptions_deadline
+  ON workflow_subscriptions (deadline) WHERE kind = 'timer';
 
-CREATE TABLE workflow_completion_subscriptions (
-  workflow_id VARCHAR NOT NULL,
-  workflow_instance_key VARCHAR NOT NULL,
-  workflow_instance_scope VARCHAR[] NOT NULL,
-  step_id VARCHAR NOT NULL,
-  step_scope_within_instance VARCHAR[] NOT NULL DEFAULT '{}',
-  step_version BIGINT NOT NULL,
-  subscriber_key VARCHAR NOT NULL,
-  completed_workflow_id VARCHAR NOT NULL,
-  completed_workflow_instance_key VARCHAR NOT NULL,
-  completed_workflow_instance_scope VARCHAR[] NOT NULL,
-  PRIMARY KEY (
-    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key,
-    completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope, step_scope_within_instance
-  ),
-  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
-    ON DELETE CASCADE
-);
+CREATE INDEX workflow_subscriptions_signal_key
+  ON workflow_subscriptions (signal_key) WHERE kind = 'signal';
+
+CREATE INDEX workflow_subscriptions_completed
+  ON workflow_subscriptions (completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope)
+  WHERE kind = 'completion';
 
 CREATE TABLE workflow_wakeups (
   workflow_id VARCHAR NOT NULL,
@@ -181,12 +165,6 @@ CREATE TABLE workflow_event_dispatch (
 );
 
 INSERT INTO workflow_event_dispatch (id, dispatched_through) VALUES (1, 0);
-
-CREATE INDEX workflow_completion_subscriptions_await
-  ON workflow_completion_subscriptions (completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope);
-
-CREATE INDEX workflow_signal_subscriptions_key
-  ON workflow_signal_subscriptions (signal_key);
 
 CREATE INDEX workflow_instances_parent
   ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);

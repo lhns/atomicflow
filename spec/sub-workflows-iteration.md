@@ -433,8 +433,8 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
    race resolves, the winner's pending subscriptions — including those
-   of nested subscopes — are deleted (a subtree delete over all three
-   subscription tables) BEFORE the winner's step row is written; losing
+   of nested subscopes — are deleted (a subtree delete of the subscription
+   table) in the transaction that writes the winner's step row; losing
    branches keep their subscriptions while unfinished and are re-run until
    they finish. A committed winner row with `hasUnfinishedBranches = false`
    never coexists with branch subscriptions. The runtime primitive is

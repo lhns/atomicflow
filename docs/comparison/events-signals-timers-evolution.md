@@ -128,7 +128,7 @@ DBOS.sleep(1800)   # seconds
 |---|---|---|---|
 | Durable | ✅ | ✅ | ✅ |
 | Clock source | `runtime.clock` (single injectable source) | SDK replay-safe clock | system/DB |
-| Deadline stored | absolute, in `workflow_timer_subscriptions` | Event | DB wakeup time |
+| Deadline stored | absolute, in `workflow_subscriptions` (`kind = 'timer'`) | Event | DB wakeup time |
 | Firing | two paths, one primitive | server timer → event | DB-backed |
 | Exactly-once firing | row lock + `no event` re-check + partial unique index | server-managed | DB-managed |
 | Fires early? | no, late only (monitored lag) | late | late |

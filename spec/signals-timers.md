@@ -17,7 +17,7 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 
 ### Why timer awaits need a subscription — and why the scheduler must not delete it
 
-Every pending timer await owns one row in `workflow_timer_subscriptions` (site, timer id, absolute deadline). It is not a wakeup hint; it matters in three ways:
+Every pending timer await owns one `kind = 'timer'` row in `workflow_subscriptions` (site, timer id, absolute deadline). It is not a wakeup hint; it matters in three ways:
 
 1. **It is the durable deadline record.** The deadline is computed once (`now + delay`, runtime clock) and stored absolutely; every replay of the await-site reads it from the row. Recomputing it from code would push timeouts forward — with a test clock advanced between runs, the recomputed deadline would land in the future again and the await would suspend forever instead of resolving.
 2. **It is the scheduling source.** The timer sweep's only input is this row's stored deadline; without the row, due timers of unattended instances would never produce a wakeup and no runner would ever come.
@@ -33,7 +33,7 @@ A due timer becomes a durable fact — a `TimerFired` event keyed by its timer i
 
 ```text
 every timerSweepInterval:
-  rows = SELECT timerId, workflowInstanceId FROM workflow_timer_subscriptions s
+  rows = SELECT timerId, workflowInstanceId FROM workflow_subscriptions s WHERE kind = 'timer'
          WHERE s.deadline <= now()                          -- runtime clock
            AND NOT EXISTS (matching TimerFired event)       -- idempotent across passes
            AND instance non-terminal
@@ -473,14 +473,12 @@ workflow_steps (
 signal_cursor (
   workflowInstanceId, signalKey, sequenceId
 )
-workflow_signal_subscriptions (
-  workflowInstanceId, stepId, subscriberKey, signalKey
-)
-workflow_timer_subscriptions (
-  workflowInstanceId, stepId, subscriberKey, timerId, deadline
-)
-workflow_completion_subscriptions (
-  workflowInstanceId, stepId, subscriberKey, completedWorkflowInstanceId
+workflow_subscriptions (
+  workflowInstanceId, stepId, subscriberKey,   -- the key
+  kind,                                        -- signal | timer | completion
+  signalKey,                                   -- signal
+  timerId, deadline,                           -- timer
+  completedWorkflowInstanceId                  -- completion
 )
 workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, attempts)
 workflow_event_dispatch (id, dispatched_through)
@@ -534,7 +532,7 @@ workflow_event_dispatch (id, dispatched_through)
   value. Await event selection and the winning branch are transaction-local:
   they are used to advance signal cursors and clean up subscriptions, then are
   not retained.
-- The three subscription tables contain only pending awaits and are never event
+- The subscription table contains only pending awaits and is never event
   rows. A timer subscription holds its absolute deadline and its subscription
   ID (assigned at registration, reused on replay); firing — by the scheduler or
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded

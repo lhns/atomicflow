@@ -33,8 +33,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, String)] =
     run(
       sql"""
-        SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_subscriptions
+        WHERE kind = 'signal' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
         ORDER BY step_id, subscriber_key
       """.query[(String, Long, String, String)].to[Vector]
     )
@@ -42,8 +42,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, java.util.UUID, Instant)] =
     run(
       sql"""
-        SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_timer_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_subscriptions
+        WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
         ORDER BY step_id, subscriber_key
       """.query[(String, Long, String, java.util.UUID, Instant)].to[Vector]
     )
@@ -55,8 +55,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""
         SELECT step_id, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope
-        FROM workflow_completion_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        FROM workflow_subscriptions
+        WHERE kind = 'completion' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
         ORDER BY step_id, subscriber_key
       """.query[(String, Long, String, String, String, Vector[String])].to[Vector]
     )

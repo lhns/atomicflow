@@ -19,8 +19,8 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   ): Vector[(java.util.UUID, Instant)] =
     run(
       sql"""
-        SELECT timer_id, deadline FROM workflow_timer_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        SELECT timer_id, deadline FROM workflow_subscriptions
+        WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
       """.query[
           (java.util.UUID, Instant)
         ].to[Vector]

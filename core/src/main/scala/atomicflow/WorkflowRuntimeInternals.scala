@@ -150,14 +150,14 @@ trait WorkflowRuntimeInternals {
 
   /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
     * own transaction, fire the site's own due timer subscriptions
-    * (`deadline <= now`), row-locked in deadline order
-    * (`ORDER BY deadline, timer_id`), appending a `TimerFired` event per
+    * (`deadline <= now`) under the instance row lock of the fence, in deadline
+    * order (`ORDER BY deadline, timer_id`), appending a `TimerFired` event per
     * due subscription that has none yet under the global append protocol (no
     * wakeup upsert); this commits immediately, so a fired event persists even if
     * the evaluation that follows rolls back (a re-fire on a later evaluation is
     * an idempotent event-exists no-op). Then, in a second transaction, register
-    * every subscriber idempotently (`ON CONFLICT DO NOTHING`), preserving an
-    * existing timer subscription's timer id and stored deadline; read all
+    * every subscriber idempotently (an unchanged subscriber is left as is),
+    * preserving an existing timer subscription's timer id and stored deadline; read all
     * subscribers' candidates and apply `decide` to the candidates merged across
     * subscribers and sorted by global `sequenceId`. `decide` runs inside this
     * second transaction while the instance row lock is held, so it must be fast
@@ -165,7 +165,7 @@ trait WorkflowRuntimeInternals {
     * persist the site's step row with state [[StepState.Await]] carrying the
     * winner, advance the winning
     * signal key's cursor when the resolution requests it, and delete the site's
-    * rows in all three subscription tables — all atomically with the registration
+    * subscription rows — all atomically with the registration
     * and candidate read. If it returns `None`, commit the registrations and
     * advance each signal cursor past its examined, rejected events. Returns the
     * persisted payload when resolved, `None` when suspended. A `decide`
@@ -179,8 +179,7 @@ trait WorkflowRuntimeInternals {
 
   /** Delete every subscription row whose `step_scope_within_instance` equals one
     * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
-    * as a prefix), across all three subscription tables (signal, timer,
-    * completion), fenced. Used by `Step.firstCompletedWithoutSuspension` to
+    * as a prefix), of every kind (signal, timer, completion), fenced. Used by `Step.firstCompletedWithoutSuspension` to
     * retire a losing branch's subscriptions once that branch finishes (the
     * winner's go with the winner write, see [[ScopeRetirement]]).
     */

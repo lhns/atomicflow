@@ -54,7 +54,7 @@ Use these terms throughout; the third column lists each library's local name.
 | **event log / history** | Durable ordered record of facts | `workflow_events` (global) | Event History (per execution) | `dbos.workflow_events` |
 | **signal event** | Async message to an instance | `Signal` | Signal | message (`send`/`recv`) |
 | **wait site / await** | A durable point where an instance waits | `Step.await` | Await / receive | `recv` / `get_event` |
-| **timer subscription** | Durable registration of a deadline | `workflow_timer_subscriptions` | timer Event | sleep wakeup |
+| **timer subscription** | Durable registration of a deadline | `workflow_subscriptions` (`kind = 'timer'`) | timer Event | sleep wakeup |
 | **update** | Synchronous request/response to an instance | `Update` (unimplemented; see `spec/signals-timers.md`) | Update | (message/event pattern) |
 | **query** | Synchronous read of instance state | (out of scope) | Query | event read (`get_event`) |
 | **child workflow** | An instance started by another instance | `startAsChild` | Child Workflow | child workflow |

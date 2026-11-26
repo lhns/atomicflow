@@ -606,8 +606,6 @@ object Step {
 
     def evaluate(): R = {
       ctx.throwIfCancelled()
-      val branchPaths = branches.map((key, _) => branchPath(ctx.currentScope, key))
-      internals.deleteSubscriptionsUnderScopePaths(branchPaths)
       val stopLosers = new AtomicBoolean(false)
       val branchContexts = branches.map((key, _) =>
         ctx.copy(scopePath = branchPath(ctx.currentScope, key), localCancellation = Some(stopLosers)))

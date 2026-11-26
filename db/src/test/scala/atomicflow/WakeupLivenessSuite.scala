@@ -260,8 +260,8 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-in"))
     run(
       sql"""
-        INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
-        VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'greet')
+        INSERT INTO workflow_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, kind, signal_key)
+        VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'signal', 'greet')
       """.update.run
     )
     run(

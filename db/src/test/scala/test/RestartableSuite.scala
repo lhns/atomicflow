@@ -55,8 +55,8 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
   private def countTimerSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""
-        SELECT COUNT(*) FROM workflow_timer_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        SELECT COUNT(*) FROM workflow_subscriptions
+        WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
       """.query[Int].unique
     )
 

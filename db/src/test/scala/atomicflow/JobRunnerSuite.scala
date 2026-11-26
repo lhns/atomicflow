@@ -38,8 +38,8 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
   private def subscriptionExists(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey): Boolean =
     run(
       sql"""
-        SELECT 1 FROM workflow_signal_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey
+        SELECT 1 FROM workflow_subscriptions
+        WHERE kind = 'signal' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey
       """.query[Int].option
     ).isDefined
 

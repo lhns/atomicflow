@@ -231,10 +231,10 @@ final class PostgresJobRunner private[atomicflow] (
     val rows = runtime.runTransaction {
       fr"""
         SELECT s.timer_id, s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope
-        FROM workflow_timer_subscriptions s
+        FROM workflow_subscriptions s
         JOIN workflow_instances i
           ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-        WHERE s.deadline <= $now
+        WHERE s.kind = 'timer' AND s.deadline <= $now
           AND i.terminal_state IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM workflow_events e

@@ -8,6 +8,7 @@ import doobie.postgres.implicits.*
 
 import java.util.concurrent.atomic.AtomicInteger
 import scala.annotation.experimental
+import scala.concurrent.duration.*
 
 @experimental
 class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
@@ -39,8 +40,8 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
   private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(Vector[String], String)] =
     run(
       sql"""
-        SELECT step_scope_within_instance, signal_key FROM workflow_signal_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key
+        SELECT step_scope_within_instance, signal_key FROM workflow_subscriptions
+        WHERE kind = 'signal' AND workflow_id = $workflowId AND workflow_instance_key = $key
         ORDER BY step_scope_within_instance, signal_key
       """.query[(Vector[String], String)].to[Vector]
     )
@@ -101,6 +102,27 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, "Succeeded")
     assertEquals(winnerFields(payload)._2, "42", "the winner row persists only the winning branch's result")
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
+  }
+
+  test("a timer branch keeps its stored deadline across re-evaluations, fires, and wins") {
+    val clock = new TestClock(java.time.Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val sig = Signal[String]("never")
+    val wf = Workflow[String, String](id = "ftr-timer") { in =>
+      Step.firstCompletedWithoutSuspension[String]("race")(
+        // A relative timer: its deadline is recomputed from the clock on every
+        // evaluation, so only the stored subscription keeps the original one.
+        "timer" -> { () => Step.await[Unit]("t", Awaitable.Timer(1.minute)); "timer" },
+        "signal" -> { () => Step.await[String]("s", Awaitable.SignalEvent(sig)) }
+      )
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    clock.advanceBy(40.seconds)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "not due yet")
+    clock.advanceBy(40.seconds)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("timer"), "due 1 minute after the first evaluation")
+    assertEquals(winnerFields(winnerRow(wf.id, "k").get._3)._1, "timer")
   }
 
   test("durable first-wins: after a winner is recorded, replay returns it even if another branch would now unblock first") {

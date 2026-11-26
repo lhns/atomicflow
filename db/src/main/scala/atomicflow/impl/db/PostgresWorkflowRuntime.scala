@@ -604,10 +604,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
              i.inherited_signal_prefixes,
              i.parent_workflow_id, i.parent_instance_key, i.parent_instance_scope,
              i.inherited_events_start_sequence_id, i.inherit_past_events
-      FROM workflow_signal_subscriptions s
+      FROM workflow_subscriptions s
       JOIN workflow_instances i
         ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-       WHERE i.terminal_state IS NULL
+       WHERE i.terminal_state IS NULL AND s.kind = 'signal'
     """ ++ signalKeyFilter
 
   /** The read path's single candidate row: the running instance itself together
@@ -1441,7 +1441,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         FOR NO KEY UPDATE
       """.query[Int].option
       locked <- sql"""
-        SELECT deadline FROM workflow_timer_subscriptions
+        SELECT deadline FROM workflow_subscriptions
         WHERE timer_id = $timerId
       """.query[java.time.Instant].option
 
@@ -1562,10 +1562,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
           direct <- sql"""
             INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, attempts)
             SELECT s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope, $now, 0
-            FROM workflow_signal_subscriptions s
+            FROM workflow_subscriptions s
             JOIN workflow_instances i
               ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-            WHERE i.terminal_state IS NULL
+            WHERE i.terminal_state IS NULL AND s.kind = 'signal'
               AND EXISTS (
                 SELECT 1 FROM workflow_events e
                 WHERE e.event_kind = 'Signal' AND e.event_key = s.signal_key
@@ -1602,10 +1602,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
           completion <- sql"""
             INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, attempts)
             SELECT s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope, $now, 0
-            FROM workflow_completion_subscriptions s
+            FROM workflow_subscriptions s
             JOIN workflow_instances i
               ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-            WHERE i.terminal_state IS NULL
+            WHERE i.terminal_state IS NULL AND s.kind = 'completion'
               AND EXISTS (
                 SELECT 1 FROM workflow_events e
                 WHERE e.event_kind = 'WorkflowCompleted'
@@ -2050,10 +2050,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     for {
       subscribers <- sql"""
         SELECT s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope
-        FROM workflow_completion_subscriptions s
+        FROM workflow_subscriptions s
         JOIN workflow_instances i
           ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-        WHERE s.completed_workflow_id = $workflowId AND s.completed_workflow_instance_key = $key AND s.completed_workflow_instance_scope = $scope
+        WHERE s.kind = 'completion' AND s.completed_workflow_id = $workflowId AND s.completed_workflow_instance_key = $key AND s.completed_workflow_instance_scope = $scope
           AND i.terminal_state IS NULL
       """.query[(WorkflowId, WorkflowInstanceKey, ScopePath)].to[Vector]
       
@@ -2173,10 +2173,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     for {
       has <- sql"""
         SELECT 1
-        FROM workflow_signal_subscriptions s
+        FROM workflow_subscriptions s
         JOIN workflow_instances i
           ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-        WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.workflow_instance_scope = $scope AND s.signal_key = $signalKey
+        WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.workflow_instance_scope = $scope
+          AND s.kind = 'signal' AND s.signal_key = $signalKey
           AND i.terminal_state IS NULL
         LIMIT 1
       """.query[Int].option
@@ -2666,16 +2667,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Unit] =
     for {
       _ <- sql"""
-        DELETE FROM workflow_timer_subscriptions
+        DELETE FROM workflow_subscriptions
         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
           AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey
       """.update.run
-      
+
       _ <- sql"""
-        INSERT INTO workflow_timer_subscriptions
-          (timer_id, workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, deadline)
-        VALUES (gen_random_uuid(), ${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetrySubscriberKey, $deadline)
-        ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance) DO NOTHING
+        INSERT INTO workflow_subscriptions
+          (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, kind, timer_id, deadline)
+        VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetrySubscriberKey, 'timer', gen_random_uuid(), $deadline)
       """.update.run
     } yield ()
 
@@ -2687,10 +2687,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val now = clock.instant()
     for {
       due <- sql"""
-        SELECT timer_id FROM workflow_timer_subscriptions
+        SELECT timer_id FROM workflow_subscriptions
         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
           AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion
-          AND deadline <= $now
+          AND kind = 'timer' AND deadline <= $now
         ORDER BY deadline, timer_id
       """.query[java.util.UUID].to[Vector]
       fired <- due.traverse { subId =>
@@ -2710,31 +2710,37 @@ class PostgresWorkflowRuntime private[atomicflow] (
     } yield fired.count(identity)
   }
 
-  private def registerSubscriberQ(lease: Lease, waitSite: WaitSite, subscriber: Subscriber): ConnectionIO[Boolean] =
-    subscriber match {
-      case Subscriber.Signal(subscriberKey, signalKey) =>
-        sql"""
-          INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
-          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${waitSite.stepId.key}, ${waitSite.stepId.scope}, ${waitSite.stepVersion}, $subscriberKey, $signalKey)
-          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key) DO NOTHING
-        """.update.run.map(_ > 0)
-        
-      case Subscriber.Timer(subscriberKey, deadline) =>
-        sql"""
-          INSERT INTO workflow_timer_subscriptions
-            (timer_id, workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, deadline)
-          VALUES (gen_random_uuid(), ${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${waitSite.stepId.key}, ${waitSite.stepId.scope}, ${waitSite.stepVersion}, $subscriberKey, $deadline)
-          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance) DO NOTHING
-        """.update.run.map(_ > 0)
-        
-      case Subscriber.Completion(subscriberKey, completedWorkflowId, completedWorkflowInstanceKey, completedScope) =>
-        sql"""
-          INSERT INTO workflow_completion_subscriptions
-            (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope)
-          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${waitSite.stepId.key}, ${waitSite.stepId.scope}, ${waitSite.stepVersion}, $subscriberKey, $completedWorkflowId, $completedWorkflowInstanceKey, $completedScope)
-          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope) DO NOTHING
-        """.update.run.map(_ > 0)
+  /** Registers one subscriber idempotently, keyed by its wait site and
+    * subscriber key. A re-registration of an unchanged subscriber is a no-op;
+    * a registered timer keeps its timer id and stored deadline (the deadline is
+    * computed once, and the id is what its `TimerFired` event is keyed by). A
+    * subscriber whose target changed (another signal key, completion target, or
+    * kind) is rewritten, so the wakeup passes match what the site now awaits.
+    * Returns whether a row was inserted or rewritten.
+    */
+  private def registerSubscriberQ(lease: Lease, waitSite: WaitSite, subscriber: Subscriber): ConnectionIO[Boolean] = {
+    val (kind, signalKey, deadline, completed) = subscriber match {
+      case Subscriber.Signal(_, k)              => ("signal", Some(k), None, None)
+      case Subscriber.Timer(_, d)               => ("timer", None, Some(d), None)
+      case Subscriber.Completion(_, wf, k, scp) => ("completion", None, None, Some((wf, k, scp)))
     }
+    sql"""
+      INSERT INTO workflow_subscriptions AS s
+        (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key,
+         kind, signal_key, timer_id, deadline, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope)
+      VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${waitSite.stepId.key}, ${waitSite.stepId.scope}, ${waitSite.stepVersion}, ${subscriber.key},
+        $kind, $signalKey, CASE WHEN $kind = 'timer' THEN gen_random_uuid() END, $deadline,
+        ${completed.map(_._1)}, ${completed.map(_._2)}, ${completed.map(_._3)})
+      ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key)
+      DO UPDATE SET kind = EXCLUDED.kind, signal_key = EXCLUDED.signal_key, timer_id = EXCLUDED.timer_id, deadline = EXCLUDED.deadline,
+        completed_workflow_id = EXCLUDED.completed_workflow_id, completed_workflow_instance_key = EXCLUDED.completed_workflow_instance_key,
+        completed_workflow_instance_scope = EXCLUDED.completed_workflow_instance_scope
+      WHERE s.kind <> EXCLUDED.kind
+        OR (EXCLUDED.kind <> 'timer'
+          AND (s.signal_key, s.completed_workflow_id, s.completed_workflow_instance_key, s.completed_workflow_instance_scope)
+            IS DISTINCT FROM (EXCLUDED.signal_key, EXCLUDED.completed_workflow_id, EXCLUDED.completed_workflow_instance_key, EXCLUDED.completed_workflow_instance_scope))
+    """.update.run.map(_ > 0)
+  }
 
   private def readSubscriberEventsQ(lease: Lease, waitSite: WaitSite, subscriber: Subscriber): ConnectionIO[Vector[SubscriberMatch]] =
     subscriber match {
@@ -2761,9 +2767,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
       case Subscriber.Timer(subscriberKey, _) =>
         for {
           subId <- sql"""
-            SELECT timer_id FROM workflow_timer_subscriptions
+            SELECT timer_id FROM workflow_subscriptions
             WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
               AND step_id = ${waitSite.stepId.key} AND step_scope_within_instance = ${waitSite.stepId.scope} AND step_version = ${waitSite.stepVersion} AND subscriber_key = $subscriberKey
+              AND kind = 'timer'
           """.query[UUID].option
           
           events <- subId match {
@@ -2794,15 +2801,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
           })
     }
 
-  /** Deletes the instance's subscription rows from all three subscription
-    * tables (`workflow_signal_subscriptions`, `workflow_timer_subscriptions`,
-    * `workflow_completion_subscriptions`) matching the instance identity and the
-    * optional `extra` predicate. Every bulk subscription cleanup funnels through
-    * here so that a future fourth subscription kind cannot be forgotten by a
-    * single cleanup path. The generated statement is
-    * `DELETE FROM <table> s WHERE <instance predicate> AND <extra>`, so `extra`
-    * may reference the subscription alias `s` (and its columns) in a join-style
-    * predicate.
+  /** Deletes the instance's subscription rows (every kind) matching the
+    * instance identity and the optional `extra` predicate. The generated
+    * statement is `DELETE FROM workflow_subscriptions s WHERE <instance
+    * predicate> AND <extra>`, so `extra` may reference the alias `s`.
     */
   private def deleteAllSubscriptionsQ(
       workflowId: WorkflowId,
@@ -2817,13 +2819,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       if (extra == Fragment.empty) instanceFilter
       else instanceFilter ++ fr" AND " ++ extra
       
-    Vector(
-      "workflow_signal_subscriptions",
-      "workflow_timer_subscriptions",
-      "workflow_completion_subscriptions"
-    ).traverse_ { table =>
-      (Fragment.const(s"DELETE FROM $table s WHERE ") ++ filter).update.run
-    }
+    (fr"DELETE FROM workflow_subscriptions s WHERE " ++ filter).update.run.map(_ => ())
   }
 
   private def deleteSiteSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
@@ -2836,7 +2832,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** Deletes the subscription rows whose `step_scope_within_instance` equals one of
     * `scopePaths` or lies beneath one (a longer array with one of `scopePaths` as
-    * a prefix), across all three subscription tables. `scopePaths` are always
+    * a prefix), of every kind. `scopePaths` are always
     * non-empty, so the array-prefix equality is a valid slice predicate.
     */
   private def deleteSubscriptionsUnderScopePathsQ(lease: Lease, scopePaths: Seq[ScopePath]): ConnectionIO[Unit] =
@@ -2852,9 +2848,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private def deleteTimerSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
     sql"""
-      DELETE FROM workflow_timer_subscriptions
+      DELETE FROM workflow_subscriptions
       WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
         AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion
+        AND kind = 'timer'
     """.update.run.map(_ => ())
 
   private def advanceCursorQ(lease: Lease, signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =

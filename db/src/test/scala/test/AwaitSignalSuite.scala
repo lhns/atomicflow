@@ -25,8 +25,8 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
   private def subscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, String)] =
     run(
       sql"""
-        SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_subscriptions
+        WHERE kind = 'signal' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
       """.query[(String, Long, String, String)].to[Vector]
     )
 

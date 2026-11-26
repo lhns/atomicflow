@@ -102,8 +102,8 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(wf, "k", "in")
     run(
       sql"""
-        INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, signal_key)
-        VALUES (${wf.id}, 'k', '{}', 'step', 1, 0, 'greet')
+        INSERT INTO workflow_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, kind, signal_key)
+        VALUES (${wf.id}, 'k', '{}', 'step', 1, 0, 'signal', 'greet')
       """.update.run
     )
 

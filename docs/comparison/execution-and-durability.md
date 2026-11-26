@@ -223,7 +223,7 @@ step (fenced writes still prevent corruption).
   `sequenceId`s are commit-ordered across all workflows. This is a deliberate
   global bottleneck whose only purpose is to make cross-tree `awaitRace`
   comparison valid.
-- *Timer firing*: lock the `workflow_timer_subscriptions` row, re-check no
+- *Timer firing*: lock the instance row, re-check the timer subscription and that no
   `TimerFired` event exists, append it — a partial unique index on
   `(instance, eventKey) WHERE eventKind='TimerFired'` is the exactly-once net.
 - *Wakeup claim*: select due wakeups with `FOR UPDATE SKIP LOCKED`, acquire the
@@ -354,7 +354,7 @@ workflow_instances        -- identity + input + generation + terminal_* + lease_
 workflow_steps            -- user steps, wait sites, first-completed, restartable regions (one table)
 workflow_events           -- global append-only log: Signal | TimerFired | WorkflowCompleted
 signal_cursor             -- per (instance, signal key) cursor into the global sequence
-workflow_signal_subscriptions / _timer_subscriptions / _completion_subscriptions
+workflow_subscriptions    -- pending awaits: signal | timer | completion
 workflow_wakeups          -- per-instance coalesced scheduling row
 workflow_event_dispatch   -- single-row watermark for async wakeup materialization
 child_close_requests      -- asynchronous parent-close delivery
