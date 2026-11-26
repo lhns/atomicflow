@@ -1488,8 +1488,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * upserts the instance's wakeup. The next acquisition (a runner claim or an
     * external run) takes over the expired lease and advances the fencing
     * token, which fences out the crashed run; until then nothing else may
-    * write. Returns whether the lease was expired. Terminal instances and live
-    * leases are untouched. Idempotent.
+    * write. Returns whether a wakeup was inserted: an instance that already has
+    * one is handled, so repeated passes do not re-select it. Terminal instances
+    * and live leases are untouched. Idempotent.
     */
   private[atomicflow] def recoverLease(instanceId: WorkflowInstanceId): Boolean = {
     val now = clock.instant()
@@ -1504,8 +1505,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
           INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, attempts)
           SELECT workflow_id, workflow_instance_key, workflow_instance_scope, $now, 0 FROM expired
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
+          RETURNING 1
         )
-        SELECT count(*)::int FROM expired
+        SELECT count(*)::int FROM woken
       """.query[Int].unique
     } > 0
   }

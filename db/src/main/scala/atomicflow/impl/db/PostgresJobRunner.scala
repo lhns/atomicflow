@@ -281,17 +281,24 @@ final class PostgresJobRunner private[atomicflow] (
     escalated
   }
 
-  /** Wakes up to 128 non-terminal instances whose lease expired, so a crashed
-    * run is replayed. Wake-only: the next acquisition takes the expired lease
-    * over and advances the fencing token. Rechecks expiry per instance so a
-    * renewed lease is left alone. Idempotent; returns the woken count.
+  /** Wakes up to 128 non-terminal instances whose lease expired and that have
+    * no wakeup, so a crashed run is replayed. Wake-only: the next acquisition
+    * takes the expired lease over and advances the fencing token. An existing
+    * wakeup is the "already handled" marker, so an unclaimed one (e.g. a
+    * workflow no runner registers) is not re-selected on every pass. Rechecks
+    * expiry per instance so a renewed lease is left alone. Idempotent; returns
+    * the woken count.
     */
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
       sql"""
-            SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
-            WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
+            SELECT i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope FROM workflow_instances i
+            WHERE i.lease_expires_at IS NOT NULL AND i.lease_expires_at <= $now AND i.terminal_state IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM workflow_wakeups w
+                WHERE w.workflow_id = i.workflow_id AND w.workflow_instance_key = i.workflow_instance_key
+                  AND w.workflow_instance_scope = i.workflow_instance_scope)
             LIMIT 128
       """
         .query[InstanceRow].to[Vector]

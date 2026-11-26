@@ -322,6 +322,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.runRecoverySweep(), 1)
       assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
       assertEquals(leaseRow(wf.id, "k").get._2, before, "recovery itself is wake-only")
+      assertEquals(runner.runRecoverySweep(), 0, "the wakeup marks the instance as handled; it is not re-selected")
 
       runner.runDriverCycle()
       assertEquals(runner.lastClaimedBatch, Vector(id), "the claim takes over the expired lease")
