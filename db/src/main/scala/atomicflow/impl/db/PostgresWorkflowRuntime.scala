@@ -2405,7 +2405,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def writeStep(
       stepId: StepId,
       stepVersion: Long,
-      row: StoredStep
+      row: StoredStep,
+      retire: Seq[ScopeRetirement]
   )(using lease: Lease): Unit = {
     runLeaseCheckedTransaction(lease) {
       for {
@@ -2424,6 +2425,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           case None =>
             deleteTimerSubscriptionsQ(lease, stepId, stepVersion)
         }
+        _ <- retire.traverse_(retireScopeQ(lease, _))
       } yield ()
     }
     row.state match {
@@ -2538,28 +2540,28 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def deleteSubscriptionsUnderScopePaths(scopePaths: Seq[ScopePath])(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease)(deleteSubscriptionsUnderScopePathsQ(lease, scopePaths))
 
-  override def deleteStepsUnderScopePaths(scopePaths: Seq[ScopePath])(using lease: Lease): Unit =
-    runLeaseCheckedTransaction(lease) {
-      scopePaths.traverse_ { path =>
+  /** Deletes what `retirement` names, within the caller's fenced transaction. */
+  private def retireScopeQ(lease: Lease, retirement: ScopeRetirement): ConnectionIO[Unit] =
+    retirement match {
+      case ScopeRetirement.Subscriptions(path) =>
+        deleteSubscriptionsUnderScopePathsQ(lease, Seq(path))
+
+      case ScopeRetirement.Generation(path) =>
         require(path.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every row")
-        sql"""
-          DELETE FROM workflow_steps
-          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-            AND step_scope_within_instance[1:${path.segments.length}] = $path
-        """.update.run.map(_ => ())
-      }
-    }
-
-  override def requestChildCloseUnderScopePath(scopePathPrefix: ScopePath)(using lease: Lease): Unit =
-    runLeaseCheckedTransaction(lease) {
-      require(scopePathPrefix.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every child")
-      // Child instances store their creation scope as the parent's instance
-      // scope, the parent's workflow id and `key@generation` marker, and then
-      // the parent's step scope path; translate the prefix accordingly.
-      val target = generationScopePrefix(lease.workflowId, lease.instanceKey, lease.instanceScope, lease.generation) ++
-        scopePathPrefix.segments
-
-      insertChildCloseRequestQ(lease.workflowId, lease.instanceKey, lease.instanceScope, target)
+        // Child instances store their creation scope as the parent's instance
+        // scope, the parent's workflow id and `key@generation` marker, and then
+        // the parent's step scope path; translate the prefix accordingly.
+        val childPrefix =
+          generationScopePrefix(lease.workflowId, lease.instanceKey, lease.instanceScope, lease.generation) ++ path.segments
+        for {
+          _ <- sql"""
+            DELETE FROM workflow_steps
+            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
+              AND step_scope_within_instance[1:${path.segments.length}] = $path
+          """.update.run
+          _ <- deleteSubscriptionsUnderScopePathsQ(lease, Seq(path))
+          _ <- insertChildCloseRequestQ(lease.workflowId, lease.instanceKey, lease.instanceScope, childPrefix)
+        } yield ()
     }
 
   override def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean = {

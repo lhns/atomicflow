@@ -14,6 +14,22 @@ trait LeaseHandle {
   private[atomicflow] def currentWfInstance: InstanceRecord
 }
 
+/** What a step write retires under a step scope path, in the write's own
+  * transaction, so the transition and its cleanup commit together. Every path
+  * must be non-empty: an empty prefix would match every row.
+  */
+enum ScopeRetirement {
+
+  /** The subscriptions at or beneath `path`: a decided race branch. */
+  case Subscriptions(path: ScopePath)
+
+  /** Everything a finished region generation left at or beneath `path`: its
+    * step rows, its subscriptions, and its children (a close request, applied
+    * per each child's `ParentClosePolicy`).
+    */
+  case Generation(path: ScopePath)
+}
+
 /** The storage and execution operations a backend implements for the library
   * core. Application code uses [[WorkflowRuntime]]; core reaches this view
   * through [[WorkflowContext]]. Every method that takes a [[Lease]] is fenced to
@@ -97,8 +113,15 @@ trait WorkflowRuntimeInternals {
     * A step key belongs to exactly one step kind: writing a row whose kind
     * differs from the kind of the row already stored at the same key fails with
     * [[StepKeyConflictException]] instead of overwriting it.
+    *
+    * `retire` names the rows the transition this write records makes obsolete
+    * (a region restart's previous generation, a race's winning branch); they
+    * are deleted in the same transaction, so no crash can leave a committed
+    * transition with its leftovers.
     */
-  def writeStep(stepId: StepId, stepVersion: Long, row: StoredStep)(using Lease): Unit
+  def writeStep(stepId: StepId, stepVersion: Long, row: StoredStep, retire: Seq[ScopeRetirement] = Seq.empty)(using
+      Lease
+  ): Unit
 
   /** Bulk-delete the step rows stored at the given `(step id, version)`
     * identities and the subscriptions registered at their sites, in one
@@ -157,33 +180,11 @@ trait WorkflowRuntimeInternals {
   /** Delete every subscription row whose `step_scope_within_instance` equals one
     * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
     * as a prefix), across all three subscription tables (signal, timer,
-    * completion), fenced. Used by
-    * `Step.firstCompletedWithoutSuspension` to retire every branch's pending
-    * subscriptions — including nested subscopes — before the winner's step row
-    * is written. The winner row is the stored
-    * first-wins marker, so deleting first means a crash in between leaves no
-    * marker, and the step's next run re-evaluates from scratch and
-    * re-deletes; a committed winner row therefore never coexists with branch
-    * subscriptions.
+    * completion), fenced. Used by `Step.firstCompletedWithoutSuspension` to
+    * retire a losing branch's subscriptions once that branch finishes (the
+    * winner's go with the winner write, see [[ScopeRetirement]]).
     */
   def deleteSubscriptionsUnderScopePaths(scopePaths: Seq[ScopePath])(using Lease): Unit
-
-  /** Delete every step row whose `step_scope_within_instance` equals one of
-    * `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
-    * as a prefix), fenced. Subscriptions are not touched; combine with
-    * [[deleteSubscriptionsUnderScopePaths]] to discard a whole scope subtree.
-    * Every scope path must be non-empty: an empty prefix would match every row.
-    */
-  def deleteStepsUnderScopePaths(scopePaths: Seq[ScopePath])(using Lease): Unit
-
-  /** Request closure of every child workflow whose creation scope lies beneath
-    * `scopePathPrefix`, a scope path of the parent's step coordinates, fenced.
-    * The request is recorded idempotently; each covered child is then closed per
-    * its stored `ParentClosePolicy` when the runtime applies pending closures.
-    * Used by the `Workflow.restartable`/`Workflow.loop` machinery to close the
-    * children of a discarded region generation.
-    */
-  def requestChildCloseUnderScopePath(scopePathPrefix: ScopePath)(using Lease): Unit
 
   /** Start a child workflow of an executing parent: create-if-absent a child
     * instance under a scope derived from the parent's identity, generation, and

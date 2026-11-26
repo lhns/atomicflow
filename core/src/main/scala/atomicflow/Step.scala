@@ -511,7 +511,7 @@ object Step {
     * `invalidateOn` inputs change, except that unfinished losing branches are
     * re-run until they finish. `assertUnchanged` inputs must remain equal.
     * Each branch has its own step scope. The winner's branch subscriptions,
-    * including nested scopes, are deleted before the winning result is stored;
+    * including nested scopes, are deleted in the transaction that stores the winning result;
     * losing branches keep their subscriptions while unfinished. A crash before
     * that write can rerun branches and select a different result.
     *
@@ -569,7 +569,12 @@ object Step {
     def branchPath(base: ScopePath, key: String): ScopePath =
       base.appended(scopedStepId.key).appended(key)
 
-    def writeWinner(winnerBranch: String, result: SerializedValue, hasUnfinishedBranches: Boolean): Unit =
+    def writeWinner(
+        winnerBranch: String,
+        result: SerializedValue,
+        hasUnfinishedBranches: Boolean,
+        retire: Seq[ScopeRetirement] = Seq.empty
+    ): Unit =
       internals.writeStep(
         scopedStepId,
         0L,
@@ -577,7 +582,8 @@ object Step {
           StepState.FirstCompleted(winnerBranch, result, hasUnfinishedBranches),
           InputFingerprints.of(fingerprints),
           None
-        )
+        ),
+        retire
       )
 
     def runLosers(losers: Seq[(String, () => WorkflowContext ?=> R)]): Seq[WorkflowSuspendedException] = {
@@ -631,9 +637,15 @@ object Step {
       decision.get match {
         case RaceOutcome.Completed(winnerBranch, winner) =>
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(winner)
-          internals.deleteSubscriptionsUnderScopePaths(Seq(branchPath(ctx.currentScope, winnerBranch)))
           val losers = branches.filterNot(_._1 == winnerBranch)
-          writeWinner(winnerBranch, SerializedValue.of(serialized), hasUnfinishedBranches = losers.nonEmpty)
+          // The winner's subscriptions go with the winner write; each loser's
+          // go when that loser finishes (runLosers).
+          writeWinner(
+            winnerBranch,
+            SerializedValue.of(serialized),
+            hasUnfinishedBranches = losers.nonEmpty,
+            Seq(ScopeRetirement.Subscriptions(branchPath(ctx.currentScope, winnerBranch)))
+          )
           val pending = runLosers(losers)
           if (pending.nonEmpty) throw new WorkflowSuspendedException(pending)
           if (losers.nonEmpty) writeWinner(winnerBranch, SerializedValue.of(serialized), hasUnfinishedBranches = false)

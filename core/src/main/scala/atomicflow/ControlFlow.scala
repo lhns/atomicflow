@@ -37,22 +37,31 @@ final class ContinueAsNewException private[atomicflow] (val encoded: SerializedV
 }
 
 /** Thrown by `RestartableScope.restart` to start the next generation of a
-  * `Workflow.restartable`/`Workflow.loop` region. Carries the [[serializedState]]
-  * of the next generation, encoded with the region's `Cacheable[S]` at the
-  * forwarder. The runtime's region loop catches it, commits the restart
-  * transition (replacing the region row's state and count, discarding the
-  * previous iteration's nested rows and subscriptions, closing its children), and
-  * re-enters the body locally in the same run.
+  * `Workflow.restartable`/`Workflow.loop` region. Carries the [[regionId]] of
+  * the region that threw it and the [[serializedState]] of the next generation,
+  * encoded with the region's `Cacheable[S]` at the forwarder. Only that
+  * region's loop catches it (an enclosing region's restart passes through a
+  * nested region); it commits the restart transition (replacing the region
+  * row's state and count, discarding the previous iteration's nested rows and
+  * subscriptions, closing its children) and re-enters the body locally in the
+  * same run.
   */
-final class RegionRestartException private[atomicflow] (val serializedState: SerializedValue) extends WorkflowControlFlowException {
+final class RegionRestartException private[atomicflow] (
+    private[atomicflow] val regionId: StepId,
+    val serializedState: SerializedValue
+) extends WorkflowControlFlowException {
   override def toString: String = "RegionRestartException"
 }
 
 /** Thrown by `LoopScope.break` to complete a `Workflow.loop` region with a
-  * result. Carries the in-memory result `R` (not persisted at the region level);
-  * the region's loop catches it and returns the value as the function's result.
+  * result. Carries the [[regionId]] of the region that threw it and the
+  * in-memory result `R` (not persisted at the region level); only that region's
+  * loop catches it and returns the value as the function's result.
   */
-final class RegionBreakException[R] private[atomicflow] (val result: R) extends WorkflowControlFlowException {
+final class RegionBreakException[R] private[atomicflow] (
+    private[atomicflow] val regionId: StepId,
+    val result: R
+) extends WorkflowControlFlowException {
   override def toString: String = "RegionBreakException"
 }
 

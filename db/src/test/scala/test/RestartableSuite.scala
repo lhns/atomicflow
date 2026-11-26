@@ -98,6 +98,45 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(observed.toList, List((0, 0L), (1, 1L), (2, 2L), (3, 3L)))
   }
 
+  test("outer.break called inside an inner loop completes the outer loop") {
+    val rt = newRuntime
+    val observed = new ListBuffer[(Int, Int)]
+    val wf = Workflow[String, String]("lp-outer-break") { in =>
+      Workflow.loop[Int, String]("outer", 0) { (o, outer) =>
+        Workflow.loop[Int, Unit]("inner", 0) { (i, inner) =>
+          observed += ((o, i))
+          if (o == 1 && i == 1) outer.break(s"broke-$o-$i")
+          if (i == 2) inner.break(())
+          i + 1
+        }
+        o + 1
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("broke-1-1"))
+    assertEquals(observed.toList, List((0, 0), (0, 1), (0, 2), (1, 0), (1, 1)))
+    assertEquals(regionPayload(wf.id, "k", "outer").map(_._1), Some(1L), "the outer loop restarted once, then broke")
+  }
+
+  test("outer.restart called inside an inner loop restarts the outer region") {
+    val rt = newRuntime
+    val observed = new ListBuffer[(Int, Int)]
+    val wf = Workflow[String, String]("rl-outer-restart") { in =>
+      Workflow.restartable[Int, String]("outer", 0) { (o, outer) =>
+        Workflow.loop[Int, String]("inner", 0) { (i, inner) =>
+          observed += ((o, i))
+          if (o < 2 && i == 1) outer.restart(o + 1)
+          if (i == 2) inner.break(s"done-$o")
+          i + 1
+        }
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-2"))
+    assertEquals(observed.toList, List((0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)))
+    assertEquals(regionPayload(wf.id, "k", "outer").map(_._1), Some(2L))
+  }
+
   test("initialState by-name seed is evaluated exactly once even when re-entered on outer replay") {
     val rt = newRuntime
     val seeds = new AtomicInteger(0)

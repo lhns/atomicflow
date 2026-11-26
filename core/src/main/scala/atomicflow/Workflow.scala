@@ -261,7 +261,7 @@ object Workflow {
   )(using
       ctx: WorkflowContext
   ): R =
-    runRestartableRegion(id, initialState) { (state, scope) =>
+    runRestartableRegion[S, R](id, initialState) { (state, scope) =>
       body(state, scope)
     }
 
@@ -275,12 +275,8 @@ object Workflow {
   )(using
       ctx: WorkflowContext
   ): R =
-    runRestartableRegion(id, initialState) { (state, scope) =>
-      val loopScope = new LoopScope[R] {
-        override def restartCount: Long = scope.restartCount
-        override def break(result: R): Nothing = throw new RegionBreakException(result)
-      }
-      val next = body(state, loopScope)(using summon[WorkflowContext])
+    runRestartableRegion[S, R](id, initialState) { (state, scope) =>
+      val next = body(state, scope)(using summon[WorkflowContext])
       scope.restart(next)
     }
 
@@ -291,7 +287,7 @@ object Workflow {
     * and break control flow. A normal return completes the region.
     */
   private def runRestartableRegion[S, R](id: String, initialState: => S)(
-      body: (S, RestartableScope[S]) => WorkflowContext ?=> R
+      body: (S, RestartableScope[S] & LoopScope[R]) => WorkflowContext ?=> R
   )(using
       ctx: WorkflowContext,
       cacheable: Cacheable[S]
@@ -301,32 +297,23 @@ object Workflow {
     given ctx.internals.Lease = ctx.currentExecution
     val regionId = StepId(id, ctx.currentScope)
 
+    def generationPath(count: Long): ScopePath = ctx.scopePath.appended(regionSegment(id, count))
+
     /** Writes the region row: the restart count and the encoded state of the
-      * current generation. The row commit is the generation boundary — the
-      * previous generation's leftovers are discarded only after this write.
+      * current generation. The row commit is the generation boundary: `retire`
+      * discards what the previous generation left behind (nested step rows,
+      * subscriptions, children) in the same transaction.
       */
-    def writeRegionRow(count: Long, encodedState: SerializedValue): Unit =
+    def writeRegionRow(count: Long, encodedState: SerializedValue, retire: Seq[ScopeRetirement] = Seq.empty): Unit =
       internals.writeStep(
         regionId, 0L,
         StoredStep(
           StepState.Region(RegionState(count, encodedState)),
           InputFingerprints.of(""),
           None
-        )
+        ),
+        retire
       )
-
-    /** Discards everything a finished region generation left behind: its nested
-      * step rows and subscriptions, and its child workflows (closed per their
-      * stored parent-close policy). Every effect is idempotent, so a crash
-      * between the region row write and this cleanup is repaired by re-running
-      * it on the next replay.
-      */
-    def discardGeneration(count: Long): Unit = {
-      val base = ctx.scopePath.appended(regionSegment(id, count))
-      internals.deleteStepsUnderScopePaths(Seq(base))
-      internals.deleteSubscriptionsUnderScopePaths(Seq(base))
-      internals.requestChildCloseUnderScopePath(base)
-    }
 
     // The key-conflict check must see rows of other step kinds at any version
     // (a step row is stored at the initial version 1 while regions read
@@ -353,25 +340,26 @@ object Workflow {
     var result: R = null.asInstanceOf[R]
     var done = false
     while (!done) {
-      if (count > 0) discardGeneration(count - 1)
-      val regionCtx = ctx.copy(scopePath = ctx.scopePath.appended(regionSegment(id, count)))
-      val scope = new RestartableScope[S] {
-        override def restartCount: Long = count
+      val regionCtx = ctx.copy(scopePath = generationPath(count))
+      val currentCount = count
+      val scope = new RestartableScope[S] with LoopScope[R] {
+        override def restartCount: Long = currentCount
         override def restart(nextState: S): Nothing =
-          throw new RegionRestartException(SerializedValue.of(cacheable.write(nextState)))
+          throw new RegionRestartException(regionId, SerializedValue.of(cacheable.write(nextState)))
+        override def break(result: R): Nothing = throw new RegionBreakException(regionId, result)
       }
       try {
         result = body(state, scope)(using regionCtx)
         done = true
       } catch {
-        case e: RegionRestartException =>
-          // Commit before cleanup; the next iteration or replay repairs any
-          // cleanup interrupted by a crash.
-          writeRegionRow(count + 1, e.serializedState)
+        // Only this region's own restart and break: an enclosing region's
+        // control flow passes through to that region.
+        case e: RegionRestartException if e.regionId == regionId =>
+          writeRegionRow(count + 1, e.serializedState, Seq(ScopeRetirement.Generation(generationPath(count))))
           count += 1
           state = cacheable.read(e.serializedState.raw)
-        case e: RegionBreakException[R] =>
-          result = e.result
+        case e: RegionBreakException[?] if e.regionId == regionId =>
+          result = e.result.asInstanceOf[R]
           done = true
       }
     }

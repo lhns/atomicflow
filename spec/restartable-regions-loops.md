@@ -95,7 +95,13 @@ trait LoopScope[R]:
 - Execution re-enters the region locally after restart; outer workflow code is
   not replayed merely to begin the next iteration.
 - Only the current state and current-generation execution records are retained,
-  so thousands of iterations do not create unbounded workflow state.
+  so thousands of iterations do not create unbounded workflow state. The
+  restart is one transaction: the region row's new count and state, the
+  deletion of the previous generation's step rows and subscriptions, and its
+  child-close request commit together.
+- `restart` and `break` belong to the region that handed out the scope. Called
+  from inside a nested region, they pass through it and act on their own
+  region (the nested region's state is part of the outer generation).
 - Normal completion keeps the final iteration. On outer replay, the body runs
   again and its durable operations reuse their cached records; the region does
   not cache its whole return value like a Step.
