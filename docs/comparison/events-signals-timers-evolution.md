@@ -44,11 +44,10 @@ status = DBOS.recv("payment_status", timeout_seconds=3600)
 - *AtomicFlow:* `sendSignal` briefly `SELECT ... FOR NO KEY UPDATE`s the instance row,
   checks that it is not already terminal (`terminal_state IS NULL`), acquires the
   **global event-append advisory lock**, calls `nextval`, and inserts one
-  immutable `Signal` row — no lease, no step mutation, no wakeup on the sender.
-  Wakeups are materialized
-  **asynchronously** by the runner's watermark dispatcher and periodic full
-  subscription scan (the full scan is the liveness guarantee; the dispatcher is
-  only latency). Consumption is a single cursor per `(instance, exact key)`;
+  immutable `Signal` row — no lease, no step mutation. It upserts the
+  addressee's wakeup in the same transaction when a subscription exists, wakes
+  inheriting descendants right after the commit, and the periodic full
+  subscription scan is the safety net. Consumption is a single cursor per `(instance, exact key)`;
   rejected-by-filter events advance the cursor on a suspending evaluation.
 - *Temporal:* a signal is appended to the instance's Event History by the server,
   which schedules a new **Workflow Task**; the SDK then runs signal handlers.

@@ -75,7 +75,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     try {
       runner.runTimerSweep()
       runner.runRecoverySweep()
-      rt.dispatchNewEvents(1000)
       rt.scanAllSubscriptions()
     } finally runner.stop(1.second)
     assertEquals(stuckInstances(), Vector.empty, "instances left that nothing will run again")
@@ -421,7 +420,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     }
 
     assertEquals(eventCount(wf.id, "k", "Signal"), 1, "the signal event committed before the fault")
-    assertEquals(wakeupCount(wf.id, "k"), 0, "the sender must not wake the instance")
+    assertEquals(wakeupCount(wf.id, "k"), 1, "the subscribed addressee is woken in the send transaction, before the fault")
 
     assertEquals(cleanRuntime().runWorkflowInstance(wf, id), WorkflowRunResult.Result("got-hello"))
   }

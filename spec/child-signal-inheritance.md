@@ -62,9 +62,10 @@ workerWorkflow.startAsChild(
 - Sending atomically appends one event. That fact is immediately readable by
   the addressed workflow and all currently eligible descendants, so there is no
   partially copied child delivery.
-- The sender walks no descendants and creates no descendant wakeups: descendant
-  wakeups are produced asynchronously by the runner's watermark dispatcher and
-  full subscription scan using the same read-time policy. Waking a superset is
+- The sender walks no descendants in its transaction: descendant wakeups are
+  upserted in a separate transaction right after the send commits, using the
+  same read-time policy, and the full subscription scan covers a crash in
+  between. Waking a superset is
   therefore harmless — the run re-applies the current policy when it gathers
   candidates, so a descendant woken by an over-broad or stale policy simply finds
   nothing and re-suspends.
@@ -107,7 +108,7 @@ workerWorkflow.startAsChild(
   `nextval` and keeps it through commit, so IDs are visible in append order.
 - One recursive CTE over `workflow_instances` enumerates each subscription's
   eligible ancestor sources by climbing the active-parent chain. The run read
-  path, the watermark dispatcher, and the full subscription scan all compose the
+  path, the after-commit inheritor wake, and the full subscription scan all compose the
   same SQL builder, so eligibility cannot drift between them. The walk is
   bounded by the parent chain (no depth cap), and every subscriber's
   `inherit_past_events` flag and `inherited_events_start_sequence_id` are

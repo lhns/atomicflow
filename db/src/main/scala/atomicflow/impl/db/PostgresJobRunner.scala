@@ -317,12 +317,11 @@ final class PostgresJobRunner private[atomicflow] (
   private var lastChildCloseSweep: Long = 0L
   private var lastFullScan: Long = 0L
 
-  /** Writers only append events, avoiding locks on subscribers.
-    *
-    * `dispatchNewEvents` provides low-latency wakeups using a watermark.
-    * Concurrent event/subscription commits can be missed after the watermark
-    * advances, so `scanAllSubscriptions` periodically rechecks every pending
-    * subscription to guarantee liveness.
+  /** Writers wake their subscribers (a send its addressee in its own
+    * transaction, inheritors and completion subscribers right after the
+    * commit). `scanAllSubscriptions` periodically rechecks every pending
+    * subscription: it covers a crash between a commit and its after-commit wake
+    * and the READ COMMITTED gap of cross-instance facts.
     */
   private def runSweepsDue(): Unit = {
     val now = System.nanoTime()
@@ -342,7 +341,6 @@ final class PostgresJobRunner private[atomicflow] (
       lastChildCloseSweep = now
       runChildCloseSweep()
     }
-    runtime.dispatchNewEvents(settings.eventDispatchBatchSize)
     if (now - lastFullScan >= settings.fullSubscriptionScanInterval.toNanos) {
       lastFullScan = now
       runtime.scanAllSubscriptions()

@@ -168,10 +168,11 @@ adds detail to, the documents in `spec/`.
   evaluation (signal filters, `Awaitable.map` functions) — has its exceptions
   carried out of the transaction intact; a workflow-code failure there is never
   reclassified as a technical failure.
-- Signal sends and completion transitions append events without scheduling
-  subscribers in their transactions. Event dispatch handles recent events;
-  the periodic full subscription scan also finds subscriptions that committed
-  concurrently with those events. Both passes retry database deadlocks.
+- A signal send wakes its addressee in its own transaction; inheriting
+  descendants and completion subscribers are woken in a separate transaction
+  right after the writer's commit. The periodic full subscription scan finds
+  what a crash in between or a concurrently committed subscription missed, and
+  retries database deadlocks.
 - Cancellation, lease recovery, and child-close sweeps use batches of 128.
   A stale lease on a terminal instance is left as is: claim and acquisition
   exclude terminal instances, so it has no effect.
@@ -210,7 +211,7 @@ adds detail to, the documents in `spec/`.
   inherits nothing, `[""]` inherits every key, and other arrays permit matching
   prefixes. There is no separate mode column. `inherit_past_events` and
   `inherited_events_start_sequence_id` store the past-event selection.
-- Signal reads, event dispatch, and the full subscription scan share the same
+- Signal reads, the after-commit inheritor wake, and the full subscription scan share the same
   recursive ancestor query. Every parent-child link must permit the key; a
   terminal parent or pending child-close request ends that part of the walk.
 - Parallel execution joins all branches before propagating control flow,

@@ -21,8 +21,6 @@ import scala.concurrent.duration.*
   *   max instances the timer sweep wakes per pass
   * @param sweepInterval
   *   cadence of the escalation and lease-recovery sweeps
-  * @param eventDispatchBatchSize
-  *   max events the best-effort watermark dispatcher processes per pass
   * @param fullSubscriptionScanInterval
   *   cadence of the full subscription scan that guarantees no lost wakeups
   * @param leaseAcquireTimeout
@@ -40,7 +38,6 @@ final case class JobRunnerSettings(
     timerSweepInterval: FiniteDuration = 250.millis,
     timerBatchSize: Int = 128,
     sweepInterval: FiniteDuration = 1.second,
-    eventDispatchBatchSize: Int = 1000,
     fullSubscriptionScanInterval: FiniteDuration = 1.minute,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
     cancelTimeout: FiniteDuration = 5.minutes,

@@ -355,7 +355,6 @@ workflow_events           -- global append-only log of Signal events
 signal_cursor             -- per (instance, signal key) cursor into the global sequence
 workflow_subscriptions    -- pending awaits: signal | timer | completion
 workflow_wakeups          -- per-instance coalesced scheduling row
-workflow_event_dispatch   -- single-row watermark for async wakeup materialization
 child_close_requests      -- asynchronous parent-close delivery
 ```
 

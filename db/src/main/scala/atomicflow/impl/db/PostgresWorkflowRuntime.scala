@@ -100,12 +100,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** Bounded retry around a multi-instance pass. Single-instance transactions
     * follow one lock order (the instance row first, the append lock last), but
-    * the bulk passes — `dispatchNewEvents` and `scanAllSubscriptions`, which
-    * upsert many instances' wakeups in one statement, and the child-close sweep's
-    * bulk delete of exhausted requests — lock rows of many instances in scan
-    * order, so two such passes (or one and a concurrent writer of the same rows)
-    * can still meet in opposite orders and raise SQLSTATE 40P01. They are
-    * idempotent, so a bounded retry lets the retried pass succeed.
+    * the bulk passes — `scanAllSubscriptions`, which upserts many instances'
+    * wakeups in one statement, and the child-close sweep's bulk delete of
+    * exhausted requests — lock rows of many instances in scan order, so two such
+    * passes (or one and a concurrent writer of the same rows) can still meet in
+    * opposite orders and raise SQLSTATE 40P01. They are idempotent, so a
+    * bounded retry lets the retried pass succeed.
     */
   private def withDeadlockRetry[A](fa: => A, attempts: Int = 5, backoffMillis: Long = 50L): A = {
     var attempt = 0
@@ -1464,40 +1464,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     } > 0
   }
 
-  /** Best-effort watermark dispatch. Processes events appended after the stored
-    * watermark and upserts the wakeups they imply. At most one dispatcher works
-    * at a time: it locks the single watermark row with FOR UPDATE SKIP LOCKED and
-    * a concurrent caller returns immediately. The log holds only `Signal`
-    * events. Returns the number of events processed.
-    */
-  private[atomicflow] def dispatchNewEvents(batchSize: Int): Int =
-    withDeadlockRetry {
-      runTransaction {
-        sql"SELECT dispatched_through FROM workflow_event_dispatch WHERE id = 1 FOR UPDATE SKIP LOCKED".query[Long].option
-          .flatMap {
-            case None => 0.pure[ConnectionIO]
-            case Some(through) =>
-              sql"""
-                SELECT sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key
-                FROM workflow_events WHERE sequence_id > $through
-                ORDER BY sequence_id LIMIT $batchSize
-              """.query[
-                  (Long, String, WorkflowId, WorkflowInstanceKey, ScopePath, String)
-                ].to[Vector].flatMap { events =>
-                  events.traverse_ { case (_, _, wf, k, s, ek) =>
-                    wakeMatchingSubscribers(wf, k, s, ek) *> wakeSignalInheritors(wf, k, s, ek)
-                  } *> events.lastOption.traverse_ { case (seq, _, _, _, _, _) =>
-                    sql"UPDATE workflow_event_dispatch SET dispatched_through = $seq WHERE id = 1".update.run
-                  }.map(_ => events.size)
-                }
-          }
-      }
-    }
-
   /** Full liveness scan. Wakes every non-terminal instance holding a pending
     * signal or completion subscription that has a visible, unconsumed candidate.
-    * This is the correctness guarantee behind the asynchronous wakeup jobs; the
-    * watermark dispatcher is only a latency optimization. Returns the number of
+    * It is the safety net behind the writers' wakeups: it covers a crash between
+    * a commit and its after-commit wake, and the READ COMMITTED gap where a
+    * subscription and a cross-instance fact commit concurrently. Returns the number of
     * wakeups inserted. Timer subscriptions are excluded (the timer sweep
     * covers them).
     */
@@ -2063,12 +2034,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Appends a `Signal` event addressed to `workflowInstanceId`. In one
     * transaction: row-lock the instance (`SELECT ... FOR NO KEY UPDATE`), return
     * [[WorkflowNotFoundException]] if absent or [[SignalSendResult.InstanceAlreadyCompleted]]
-    * if it is already terminal (`terminal_state IS NOT NULL`), else append the
-    * event (payload from the signal's [[Cacheable]]). The terminal transition
+    * if it is already terminal (`terminal_state IS NOT NULL`), else upsert the
+    * addressee's wakeup when it holds a subscription for the key, and append
+    * the event last (payload from the signal's [[Cacheable]]). Await
+    * registration fences the same row, so a subscription and a send serialize:
+    * either the send sees the subscription and wakes the instance, or the
+    * registration's candidate read sees the event. The terminal transition
     * that deletes the addressed events commits under the same row lock, so a
     * signal either commits before the transition — or is rejected as
-    * already-completed. The sender only appends; wakeups are produced
-    * asynchronously by the job runner. Does not acquire the execution lease.
+    * already-completed. Descendants that inherit the key are woken in a
+    * separate transaction after the commit. Does not acquire the execution
+    * lease.
     */
   override def sendSignal[A: Cacheable as cacheable](
       workflowInstanceId: WorkflowInstanceId,
@@ -2093,61 +2069,48 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
           case Some(None) =>
             for {
+              subscribed <- sql"""
+                SELECT 1 FROM workflow_subscriptions
+                WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = $scope
+                  AND kind = 'signal' AND signal_key = $key
+                LIMIT 1
+              """.query[Int].option
+              _ <- subscribed.traverse_(_ => upsertWakeupQ(workflowId, instanceKey, scope, clock.instant()))
               _ <- appendEvent(workflowId, instanceKey, scope, "Signal", key, payload)
             } yield SignalSendResult.Success
         }
       } yield result
     }
     result match {
-      case SignalSendResult.Success => faultInjector.afterEventAppendCommit()
-      case _                        => ()
+      case SignalSendResult.Success =>
+        faultInjector.afterEventAppendCommit()
+        wakeSignalInheritorsAfterCommit(workflowInstanceId, key)
+      case _ => ()
     }
     result
   }
 
-  /** Upserts the addressed instance's own wakeup row when it holds a pending
-    * subscription for the exact signal key and is still non-terminal. Called by
-    * the best-effort watermark dispatcher; the sender no longer upserts wakeups,
-    * and no payload filter is evaluated (only key-matching subscriptions matter).
+  /** Wakes the descendants that inherit `signalKey` from `source`, in its own
+    * transaction after the send committed. It holds no instance row lock
+    * (wakeup inserts take only `FOR KEY SHARE`), so a sender never locks an
+    * ancestor and a descendant together. Best effort: a failure leaves the wake
+    * to the full subscription scan.
     */
-  private def wakeMatchingSubscribers(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: ScopePath,
-      signalKey: SignalKey
-  ): ConnectionIO[Unit] = {
-    val now = clock.instant()
-    for {
-      has <- sql"""
-        SELECT 1
-        FROM workflow_subscriptions s
-        JOIN workflow_instances i
-          ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
-        WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.workflow_instance_scope = $scope
-          AND s.kind = 'signal' AND s.signal_key = $signalKey
-          AND i.terminal_state IS NULL
-        LIMIT 1
-      """.query[Int].option
-      
-      _ <- if (has.isDefined)
-          sql"""
-            INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, attempts)
-            VALUES ($workflowId, $key, $scope, $now, 0)
-            ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
-          """.update.run.map(_ => ())
-        else 
-          ().pure[ConnectionIO]
-    } yield ()
-  }
+  private def wakeSignalInheritorsAfterCommit(source: WorkflowInstanceId, signalKey: SignalKey): Unit =
+    try runTransaction(wakeSignalInheritors(source.workflowId, source.workflowInstanceKey, source.scope, signalKey))
+    catch {
+      case e: WorkflowTechnicalException =>
+        log.warn(s"Could not wake the inheritors of $signalKey sent to $source; the full scan will", e)
+    }
 
   /** Upserts a wakeup for every non-terminal subscriber of `signalKey` whose
     * signal-inheritance sources ([[inheritedSignalSources]]) include the
     * addressed instance, so one committed send reaches all descendants that
     * inherit it. The awaiting descendant re-checks eligibility when it runs.
     * Waking a superset would be harmless, but the shared source query already
-    * applies the exact policy, so no superset is needed. Called by the
-    * best-effort watermark dispatcher; the full subscription scan covers the
-    * same case independently.
+    * applies the exact policy, so no superset is needed. Called right after a
+    * send commits; the full subscription scan covers the same case
+    * independently.
     */
   private def wakeSignalInheritors(
       sourceWorkflowId: WorkflowId,
@@ -2164,6 +2127,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     fr"""
       ) a
       WHERE a.source_wf = $sourceWorkflowId AND a.source_key = $sourceInstanceKey AND a.source_scope = $sourceScope
+      ORDER BY 1, 2, 3
       ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
     """).update.run.map(_ => ())
   }

@@ -8,11 +8,12 @@ import test.PostgresWorkflowRuntimeSuite
 
 import scala.concurrent.duration.*
 
-/** Wakeup liveness: the asynchronous wakeup jobs that replace the synchronous, sender-side wakeup creation. A
-  * best-effort watermark dispatcher gives low-latency wakeups for the common case; a periodic full
-  * subscription scan is the correctness guarantee that no wakeup is ever lost. Lives in package `atomicflow`
-  * so it can drive the package-private `runDriverCycle` hook and the `private[atomicflow]` dispatch/scan
-  * hooks deterministically.
+/** Wakeup liveness: writers wake the subscribers they affect (a signal send wakes its subscribed addressee in its
+  * own transaction and the inheriting descendants right after the commit; a terminal transition wakes the
+  * completion subscribers right after the commit). A periodic full subscription scan is the correctness guarantee
+  * for a wake lost between a commit and its after-commit wake, or for a subscription committing concurrently with
+  * a cross-instance fact. Lives in package `atomicflow` so it can drive the package-private `runDriverCycle` hook
+  * and the `private[atomicflow]` scan hook deterministically.
   */
 class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
 
@@ -44,18 +45,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
       """.update.run
     )
 
-  private def watermark(): Long =
-    run(sql"""
-      SELECT dispatched_through FROM workflow_event_dispatch WHERE id = 1
-    """.query[Long].unique)
-
-  private def maxEventSeq(): Long =
-    run(sql"""
-      SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events
-    """.query[Long].unique)
-
-
-  test("best-effort dispatch wakes a suspended direct-signal subscriber after a send") {
+  test("a send wakes a suspended direct-signal subscriber without any runner pass") {
     val rt = newRuntime
     val signal = Signal[String]("greet")
     val wf = Workflow[String, String](id = "liv-direct") { _ =>
@@ -65,10 +55,10 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val inst = rt.createWorkflowInstance(wf, "k", "in")
     val id = inst.id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    deleteWakeup(wf.id, "k", ScopePath.empty)
 
     signal.send(id, "hi")(using rt)
-    assert(!wakeupExists(wf.id, "k", ScopePath.empty),
-           "a send only appends the event; the sender must not wake subscribers synchronously")
+    assert(wakeupExists(wf.id, "k", ScopePath.empty), "the send must wake its subscribed addressee itself")
 
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
@@ -77,7 +67,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("full scan recovers a completion await whose wakeup was lost") {
+  test("a child's completion wakes its completion subscriber; the full scan recovers a lost wakeup") {
     val rt = newRuntime
     val child = Workflow[String, Int]("liv-child") { in => in.length }
     val parent = Workflow[String, String]("liv-parent") { _ =>
@@ -90,37 +80,34 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parent, "p", "in").id
     assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.WorkflowSuspended)
+    deleteWakeup(parent.id, "p", ScopePath.empty)
     val childId = rt.getChildWorkflowInstances(parentId).head.id
     assertEquals(rt.runWorkflowInstance(child, childId), WorkflowRunResult.Result(2))
+    assert(
+      wakeupExists(parent.id, "p", ScopePath.empty),
+      "the child's terminal commit must wake its completion subscriber"
+    )
+
+    // Simulate a crash between the terminal commit and the wake.
     deleteWakeup(parent.id, "p", ScopePath.empty)
-    assert(!wakeupExists(parent.id, "p", ScopePath.empty),
-           "the parent's wakeup is gone; its completion await is otherwise unobservable")
+    assert(!wakeupExists(parent.id, "p", ScopePath.empty), "the parent's wakeup is lost")
 
     val settings = JobRunnerSettings.forTests.copy(
       fullSubscriptionScanInterval = 0.millis
     )
     // The runner's registry holds only a bystander workflow, so the claim never
-    // touches the parent's wakeup while the dispatcher and full scan (which are
-    // registry-independent) still run every cycle.
+    // touches the parent's wakeup while the full scan (registry-independent)
+    // still runs every cycle.
     val bystander = Workflow[String, String](id = "liv-parent-bystander")(in => s"out-$in")
     val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
-      runner.runDriverCycle()
-      assertEquals(
-        watermark(),
-        maxEventSeq(),
-        "cycle 1 advanced the dispatcher watermark past the completion event, so a second cycle cannot dispatch it again"
-      )
-      deleteWakeup(parent.id, "p", ScopePath.empty)
-      assert(!wakeupExists(parent.id, "p", ScopePath.empty),
-             "the dispatcher already passed the completion event; only the full scan can wake the parent now")
       runner.runDriverCycle()
       assert(wakeupExists(parent.id, "p", ScopePath.empty), "the full scan must recreate the lost completion wakeup")
       assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.Result("child:2"))
     } finally runner.stop(1.second)
   }
 
-  test("full scan recovers an inherited-signal await whose wakeup was lost") {
+  test("a send wakes an inheriting descendant; the full scan recovers a lost inherited-signal wakeup") {
     val rt = newRuntime
     val signal = Signal[String]("order/approve")
     val child = Workflow[String, String]("liv-worker") { _ =>
@@ -144,8 +131,15 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
 
     signal.send(parentId, "x")(using rt)
     assert(
+      wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
+      "the send wakes the inheriting descendant right after its commit"
+    )
+
+    // Simulate a crash between the send commit and the descendant wake.
+    deleteWakeup(child.id, childId.workflowInstanceKey, childId.scope)
+    assert(
       !wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
-      "a send only appends; no inherited wakeup is created synchronously"
+      "the descendant's wakeup is lost"
     )
 
     val settings = JobRunnerSettings.forTests.copy(
@@ -154,17 +148,6 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val bystander = Workflow[String, String](id = "liv-child-bystander")(in => s"out-$in")
     val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
-      runner.runDriverCycle()
-      assertEquals(
-        watermark(),
-        maxEventSeq(),
-        "cycle 1 advanced the dispatcher watermark past the signal event, so a second cycle cannot dispatch it again"
-      )
-      deleteWakeup(child.id, childId.workflowInstanceKey, childId.scope)
-      assert(
-        !wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
-        "the dispatcher already passed the event; only the full scan can wake the child now"
-      )
       runner.runDriverCycle()
       assert(
         wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
@@ -198,8 +181,15 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
 
     signal.send(parentId, "x")(using rt)
     assert(
+      wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
+      "the send wakes the inheriting descendant right after its commit"
+    )
+
+    // Simulate a crash between the send commit and the descendant wake.
+    deleteWakeup(child.id, childId.workflowInstanceKey, childId.scope)
+    assert(
       !wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
-      "a send only appends; no inherited wakeup is created synchronously"
+      "the descendant's wakeup is lost"
     )
 
     val settings = JobRunnerSettings.forTests.copy(
@@ -208,17 +198,6 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val bystander = Workflow[String, String](id = "liv-child-some-bystander")(in => s"out-$in")
     val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
-      runner.runDriverCycle()
-      assertEquals(
-        watermark(),
-        maxEventSeq(),
-        "cycle 1 advanced the dispatcher watermark past the signal event, so a second cycle cannot dispatch it again"
-      )
-      deleteWakeup(child.id, childId.workflowInstanceKey, childId.scope)
-      assert(
-        !wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
-        "the dispatcher already passed the event; only the full scan can wake the child now"
-      )
       runner.runDriverCycle()
       assert(
         wakeupExists(child.id, childId.workflowInstanceKey, childId.scope),
@@ -253,32 +232,41 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("dispatch does not create a wakeup for a terminal instance") {
+  test("a send or completion never creates a wakeup for a terminal subscriber") {
     val rt = newRuntime
+    val signal = Signal[String]("greet")
     val wf = Workflow[String, String](id = "liv-terminal") { in => s"out-$in" }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-in"))
+    // A stale signal subscription left on the terminal instance.
     run(
       sql"""
         INSERT INTO workflow_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, kind, signal_key)
         VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'signal', 'greet')
       """.update.run
     )
-    run(
-      sql"""
-        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key, payload, created_at)
-        VALUES (nextval('workflow_event_sequence'), 'Signal', ${wf.id}, 'k', '{}', 'greet', 'hi', now())
-      """.update.run
-    )
+    deleteWakeup(wf.id, "k", ScopePath.empty)
 
-    rt.dispatchNewEvents(1000)
-    assert(
-      !wakeupExists(wf.id, "k", ScopePath.empty),
-      "the dispatcher must not create a wakeup for a terminal instance"
-    )
+    assertEquals(signal.send(id, "hi")(using rt), SignalSendResult.InstanceAlreadyCompleted)
+    assert(!wakeupExists(wf.id, "k", ScopePath.empty), "a send must not wake a terminal addressee")
+
+    // A terminal parent still holding a completion subscription on a child that then completes.
+    val child = Workflow[String, Int]("liv-terminal-child") { in => in.length }
+    val parent = Workflow[String, String]("liv-terminal-parent") { _ =>
+      val c = child.startAsChild("c", "hi")
+      Step.await[WorkflowCompletionResult[Int]]("await-child", c.completion)
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parent, "p", "in").id
+    assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.WorkflowSuspended)
+    rt.terminate(parentId)
+    deleteWakeup(parent.id, "p", ScopePath.empty)
+    val childId = rt.getChildWorkflowInstances(parentId).head.id
+    assertEquals(rt.runWorkflowInstance(child, childId), WorkflowRunResult.Result(2))
+    assert(!wakeupExists(parent.id, "p", ScopePath.empty), "a completion must not wake a terminal subscriber")
   }
 
-  test("one send to the parent wakes every currently eligible suspended child asynchronously") {
+  test("one send to the parent wakes every currently eligible suspended child") {
     val rt = newRuntime
     val signal = Signal[String]("order/approve")
     val childWf = Workflow[String, String]("liv-eligible-child") { _ =>
@@ -303,23 +291,10 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     assert(!wakeupExists(childWf.id, "c2", c2.scope))
 
     signal.send(parentId, "x")(using rt)
-    assert(!wakeupExists(childWf.id, "c1", c1.scope), "the sender must not wake descendants synchronously")
-    assert(!wakeupExists(childWf.id, "c2", c2.scope), "the sender must not wake descendants synchronously")
-
-    val bystander = Workflow[String, String](id = "liv-eligible-bystander") { in => s"out-$in" }
-    val runner = rt.startJobRunnerForTests(
-      Seq(bystander),
-      JobRunnerSettings.forTests.copy(fullSubscriptionScanInterval = 0.millis)
-    )
-    try {
-      runner.runDriverCycle()
-      assert(wakeupExists(childWf.id, "c1", c1.scope),
-             "an eligible suspended child is woken by the parent send")
-      assert(wakeupExists(childWf.id, "c2", c2.scope),
-             "an eligible suspended child is woken by the parent send")
-      assertEquals(rt.runWorkflowInstance(childWf, c1), WorkflowRunResult.Result("done"))
-      assertEquals(rt.runWorkflowInstance(childWf, c2), WorkflowRunResult.Result("done"))
-    } finally runner.stop(1.second)
+    assert(wakeupExists(childWf.id, "c1", c1.scope), "an eligible suspended child is woken by the parent send")
+    assert(wakeupExists(childWf.id, "c2", c2.scope), "an eligible suspended child is woken by the parent send")
+    assertEquals(rt.runWorkflowInstance(childWf, c1), WorkflowRunResult.Result("done"))
+    assertEquals(rt.runWorkflowInstance(childWf, c2), WorkflowRunResult.Result("done"))
   }
 
   test("repeated full scans are idempotent: at most one wakeup row per instance") {
@@ -332,6 +307,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     signal.send(id, "hi")(using rt)
+    deleteWakeup(wf.id, "k", ScopePath.empty)
 
     val bystander = Workflow[String, String](id = "liv-bystander") { in => s"out-$in" }
     val runner = rt.startJobRunnerForTests(
@@ -344,5 +320,32 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(wakeupCount(wf.id, "k", ScopePath.empty), 1, "repeated scans must not accumulate duplicate wakeups")
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("got:hi"))
     } finally runner.stop(1.second)
+  }
+
+  test("a send creates the addressee's wakeup only when it holds a subscription for that key") {
+    val rt = newRuntime
+    val awaited = Signal[String]("awaited")
+    val unawaited = Signal[String]("unawaited")
+    val wf = Workflow[String, String](id = "liv-writer") { _ =>
+      val v = Step.await[String]("w", Awaitable.SignalEvent(awaited))
+      s"got:$v"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    deleteWakeup(wf.id, "k", ScopePath.empty)
+
+    awaited.send(id, "hi")(using rt)
+    assert(wakeupExists(wf.id, "k", ScopePath.empty), "the wakeup exists as soon as send returns")
+
+    // An instance with no subscription for the sent key gets no wakeup.
+    val other = Workflow[String, String](id = "liv-writer-other") { _ =>
+      Step.await[String]("w", Awaitable.SignalEvent(Signal[String]("something-else")))
+      "done"
+    }
+    val otherId = rt.createWorkflowInstance(other, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(other, otherId), WorkflowRunResult.WorkflowSuspended)
+    deleteWakeup(other.id, "k", ScopePath.empty)
+    unawaited.send(otherId, "x")(using rt)
+    assert(!wakeupExists(other.id, "k", ScopePath.empty), "no subscription for the key: no wakeup")
   }
 }

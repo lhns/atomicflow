@@ -159,12 +159,5 @@ CREATE TABLE workflow_wakeups (
     ON DELETE CASCADE
 );
 
-CREATE TABLE workflow_event_dispatch (
-  id SMALLINT PRIMARY KEY CHECK (id = 1),
-  dispatched_through BIGINT NOT NULL
-);
-
-INSERT INTO workflow_event_dispatch (id, dispatched_through) VALUES (1, 0);
-
 CREATE INDEX workflow_instances_parent
   ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);

@@ -186,9 +186,9 @@ trait WorkflowRuntime {
   IS NULL`) to prevent appending an event when that instance is completed or
   completing. It then acquires the global event
   allocator mutex (pg_advisory_lock in postgres), obtains the next `sequenceId` (`SEQUENCE CACHE 1` in postgres), appends the one immutable event, and commits.
-  The sender creates no wakeups: signal and completion wakeups are produced
-  asynchronously by the job runner's watermark dispatch and full subscription
-  scan (see `running-workflows.md`, "Sources of wakeups").
+  Before the append, the sender upserts the addressee's wakeup when it holds a
+  subscription for the key; descendants that inherit the key are woken right
+  after the commit (see `running-workflows.md`, "Sources of wakeups").
 - One committed append is immediately readable by the addressed workflow and
   every child currently allowed to inherit it. This is atomic for all children
   because the immutable fact is stored once; there is no per-child delivery or
@@ -455,7 +455,6 @@ workflow_subscriptions (
   completedWorkflowInstanceId                  -- completion
 )
 workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, attempts)
-workflow_event_dispatch (id, dispatched_through)
 ```
 
 `workflow_events` holds one event kind (enforced by a CHECK constraint):
@@ -529,34 +528,29 @@ workflow_event_dispatch (id, dispatched_through)
   inheritance relationship and `inheritedEventsStartSequenceId`.
 - Cursor advancement and successful `workflow_steps` persistence happen in one
   atomic transaction. Signal events themselves have no acknowledged state.
-- Wakeups are produced asynchronously, not by writers. Signal sends and terminal
-  transitions write only their own rows (short transactions, no deadlock against
-  subscribers); terminal transitions wake completion subscribers in a separate
-  transaction right after their commit; two definition-agnostic job-runner passes materialize the
-  coalesced `workflow_wakeups` rows. The best-effort watermark dispatcher
-  (`JobRunnerSettings.eventDispatchBatchSize`, default 1000; every driver cycle)
-  locks the single-row `workflow_event_dispatch` table with `FOR UPDATE SKIP
-  LOCKED`, reads events with `sequence_id > dispatched_through` in order, upserts
-  the wakeups each implies (direct subscriber + eligible descendants), and
-  advances the watermark to the last processed event in the same transaction. At
-  most one dispatcher works at a time; concurrent callers return immediately. The
-  full subscription scan (`JobRunnerSettings.fullSubscriptionScanInterval`,
-  default 1 minute) wakes every non-terminal instance holding a pending signal or
-  completion subscription with a visible, unconsumed candidate. No payload filter
-  is evaluated by the sender, and it does not alter cached Step results.
-- No lost wakeups: the periodic full subscription scan is the liveness guarantee
-  — it wakes every non-terminal instance holding a pending signal or completion
-  subscription whose candidate is visible and unconsumed (a direct signal event
-  after the shared cursor; an inherited event from an eligible ancestor after the
-  cursor and, unless `inheritPastEvents`, after
+- Wakeups are written by the writers. A send upserts its addressee's wakeup in
+  its own transaction (after the addressee's row lock, before the append lock)
+  when the addressee holds a subscription for the key; await registration fences
+  the same row, so either the send sees the subscription or the registration's
+  candidate read sees the event. Wakes of other instances — descendants that
+  inherit a sent key, subscribers of a completed instance — run in a separate
+  transaction right after the writer's commit that only inserts wakeups (`FOR
+  KEY SHARE` on the subscribers), never in the writer's transaction: a
+  completing child that woke its parent there would lock descendant before
+  ancestor. The former rationale for asynchronous wakeups — no deadlock against
+  subscribers — is now met by that lock order. No payload filter is evaluated by
+  the sender, and it does not alter cached Step results.
+- No lost wakeups: the periodic full subscription scan
+  (`JobRunnerSettings.fullSubscriptionScanInterval`, default 1 minute) is the
+  safety net — it wakes every non-terminal instance holding a pending signal or
+  completion subscription whose candidate is visible and unconsumed (a direct
+  signal event after the shared cursor; an inherited event from an eligible
+  ancestor after the cursor and, unless `inheritPastEvents`, after
   `inherited_events_start_sequence_id`; or the awaited instance's terminal
-  row). The watermark dispatcher is only latency: it can
-  miss a subscription that commits concurrently with an event and then advance
-  its watermark past that event, so correctness cannot rest on the writer; only
-  the independent, periodic re-scan of subscriptions guarantees no lost wakeup.
-  This is why writers only append: the dispatcher gives low-latency wakeups when
-  the subscription already committed before the event, and the scan covers the
-  concurrent case.
+  row). It covers a crash between a commit and its after-commit wake, and the
+  READ COMMITTED gap where a cross-instance fact (an ancestor's signal, a
+  target's completion) commits concurrently with the subscription, so neither
+  writer sees the other.
 - The wakeup row is removed only when a worker has obtained the workflow lease
   and accepted responsibility for that wakeup. A delivery that races with that
   removal upserts a replacement row, so an event cannot be missed while an

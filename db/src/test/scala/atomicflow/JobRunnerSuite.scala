@@ -471,9 +471,9 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       runner.testRunWrapper = _ => throw new WorkflowTechnicalException(new RuntimeException("db down"))
       runner.runDriverCycle()
       assertEquals(wakeupRow(wf.id, "k").get._2, 1, "restored by the technical-failure path")
-      // An event-driven delivery lands after the restore: it must not reset
+      // A writer-side wake lands after the restore: it must not reset
       // attempts or duplicate the row.
-      rt.dispatchNewEvents(1000)
+      rt.wakeInstance(WorkflowInstanceId(wf.id, "k"))
       assertEquals(wakeupCount(wf.id, "k"), 1, "at most one wakeup row per instance")
       assertEquals(wakeupRow(wf.id, "k").get._2, 1, "the coalesced delivery must not reset attempts")
     } finally runner.stop(1.second)
