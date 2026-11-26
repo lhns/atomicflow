@@ -500,4 +500,41 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     }
     assert(e.getMessage.contains("(and 2 more)"), e.getMessage)
   }
+
+  test("reset during a live run fences the run: its next step write fails and the re-run re-executes the reset steps") {
+    val rt = newRuntime
+    val aRuns = new AtomicInteger(0)
+    val bRuns = new AtomicInteger(0)
+    val inB = new java.util.concurrent.CountDownLatch(1)
+    val resetDone = new java.util.concurrent.CountDownLatch(1)
+    val wf = Workflow[String, String](id = "reset-live") { in =>
+      Step.atLeastOnce[String]("A") { aRuns.incrementAndGet(); "a" }
+      Step.atLeastOnce[String]("B") {
+        if (bRuns.incrementAndGet() == 1) {
+          inB.countDown()
+          resetDone.await()
+        }
+        "b"
+      }
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    val outcome = new java.util.concurrent.atomic.AtomicReference[Either[Throwable, WorkflowRunResult[String]]]()
+    val live = new Thread(() =>
+      outcome.set(
+        try Right(rt.runWorkflowInstance(wf, id))
+        catch { case t: Throwable => Left(t) }
+      )
+    )
+    live.start()
+    inB.await()
+    rt.resetWorkflow[String, String](id, Seq(stepId"/A"), Seq.empty)(using wf)
+    resetDone.countDown()
+    live.join()
+
+    assert(outcome.get().left.exists(_.isInstanceOf[LeaseLostException]), s"the live run must lose its lease, got ${outcome.get()}")
+    assertEquals(stepIds(wf.id, "k"), Set("B"), "the fenced run wrote nothing after the reset (B stays Started, A stays erased)")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    assertEquals(aRuns.get(), 2, "the re-run re-executes the reset step")
+  }
 }

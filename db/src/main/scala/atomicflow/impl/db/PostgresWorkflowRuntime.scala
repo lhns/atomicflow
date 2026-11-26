@@ -491,8 +491,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
         // what is needed. The successor generation's children carry the
         // incremented marker and never match this prefix.
         _ <- insertChildCloseRequestQ(wf, key, scope, generationScopePrefix(wf, key, scope, generation))
+        // Revoke the lease like termination does: a run live during the reset
+        // fails its next fenced write instead of writing over the reset, and
+        // the re-run need not wait out the old lease.
         _ <- sql"""
-          UPDATE workflow_instances SET generation = generation + 1
+          UPDATE workflow_instances
+          SET generation = generation + 1,
+              fencing_token = nextval('workflow_fencing_token_seq'), lease_expires_at = NULL
           WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
         """.update.run
         _ <- upsertWakeupQ(wf, key, scope, now)
@@ -682,11 +687,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * throws [[WorkflowInputConflictException]] when the stored input differs.
     * The child body is never executed here.
     *
-    * Fenced on the parent's generation: the transaction first locks the
-    * parent's own row (the caller is the parent's run) and requires the current
-    * generation to equal the run's, so an orphaned pre-`continueAsNew` run can
-    * never attach a stale-generation child after the successor generation — and
-    * after its closure record — has committed. Lock order: the parent (ancestor)
+    * Fenced on the parent run's token, like every lease-checked write: the
+    * transaction first locks the parent's own row (the caller is the parent's
+    * run) and requires its fencing token. Every transition that closes the
+    * parent's children from outside the run (reset, termination) advances the
+    * token, and `continueAsNew` ends the run that commits it, so a superseded
+    * run can never attach a child after a closing transition — and its closure
+    * record — has committed. Lock order: the parent (ancestor)
     * row, then the new child row and its wakeup, then the global event-append
     * lock last, like every other transaction.
     *
@@ -702,10 +709,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     *    (`ScopePath.deriveChildScope`), so a closure request naming an old
     *    generation or iteration can never match a child started later; old and
     *    new same-key children are distinct rows.
-    * 2. *Attachment fencing* — only the parent's current-generation, non-terminal
-    *    run may attach: the transaction locks the parent's own row first and
-    *    refuses on generation mismatch or terminal parent, so nothing attaches
-    *    under or after a closing transition.
+    * 2. *Attachment fencing* — only the run holding the parent's lease may
+    *    attach: the transaction locks the parent's own row first and refuses
+    *    on a token mismatch, so nothing attaches under or after a closing
+    *    transition.
     * 3. *No start into a closed scope* — a start is refused when a
     *    `child_close_requests` row of the parent already covers the derived
     *    scope, so a stale same-generation run cannot attach into an
@@ -742,25 +749,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
     val inheritPrefixes = permittedSignalPrefixes(inheritSignals)
 
-    val existing = runTransaction {
+    val existing = runLeaseCheckedTransaction(lease) {
       for {
-        fence <- sql"""
-          SELECT generation, terminal_state FROM workflow_instances
-          WHERE workflow_id = ${parentId.workflowId} AND workflow_instance_key = ${parentId.workflowInstanceKey}
-            AND workflow_instance_scope = ${parentId.scope}
-          FOR NO KEY UPDATE
-        """.query[(Long, Option[String])].option
-        _ <- fence match {
-          case Some((g, None)) if g == parentGeneration => ().pure[ConnectionIO]
-          case _                                         => throw LeaseLostException(parentId)
-        }
-        // A stale run of the same generation (an orphan that lost its lease
-        // after a region restart) must not attach a child into an already
-        // discarded interior: refuse when a pending closure of this parent
-        // already covers the derived scope. A legitimate new child never
-        // matches a pending closure (targets name discarded interiors or old
-        // generations), and the parent-row lock above serializes this check
-        // against concurrent closures.
+        // Never attach a child into an already discarded interior: refuse
+        // when a pending closure of this parent already covers the derived
+        // scope. A legitimate new child never matches a pending closure
+        // (targets name discarded interiors or old generations), and the
+        // parent-row lock of the fence serializes this check against
+        // concurrent closures.
         covered <- sql"""
           SELECT 1 FROM child_close_requests r
           WHERE r.workflow_id = ${parentId.workflowId} AND r.workflow_instance_key = ${parentId.workflowInstanceKey}
@@ -965,7 +961,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * childless case: terminal transitions of leaf instances, `continueAsNew`
     * and region restarts without children), so bookkeeping stays proportional
     * to actual pending work. The existence check is a read of the parent's own
-    * children in the caller's transaction; the `startChild` generation fence
+    * children in the caller's transaction; the `startChild` token fence
     * guarantees no matching child can attach afterwards. The composite primary
     * key deduplicates identical targets, so re-recording the same closure is
     * idempotent.
@@ -1893,7 +1889,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Clears the lease expiry if this run still holds the fencing token and a
     * lease is still recorded. "Owned" means the row still records this run's
     * token and `lease_expires_at` is still set: if the lease was revoked by
-    * termination or taken over by another acquire (both advance the token), or
+    * reset or termination or taken over by another acquire (all advance the token), or
     * already released, this updates no row and cannot clobber the new owner's
     * lease. Optimization only — correctness relies on expiry plus fencing, not
     * on this release. The external (`run`) path calls it in a `finally`; the job
@@ -2602,7 +2598,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * version after acquiring the lock, so a row that no longer records this
     * run's token matches no rows. The token changes on every ownership change —
     * each acquire (including takeover of an expired lease), and each revocation
-    * by termination — and
+    * by reset or termination — and
     * is drawn from a sequence, so it never repeats across an instance's
     * deletion and recreation; a fenced-out run always matches no rows.
     */

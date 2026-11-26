@@ -47,8 +47,8 @@ adds detail to, the documents in `spec/`.
 - The handle's identity is stable during a run. A backend that mutates its
   contents must support concurrent access from parallel branches.
 - The Postgres lease has no owner column: the fencing token is the ownership
-  identity. Every acquire advances it, and so does every revocation (lease
-  recovery, termination), so a token-only guard fences out superseded runs;
+  identity. Every acquire advances it, and so does every revocation (reset,
+  termination), so a token-only guard fences out superseded runs;
   `lease_expires_at` is the liveness signal the recovery sweep acts on.
   The token comes from a database sequence, so it never repeats across an
   instance's deletion and recreation. `JobRunnerSettings.workerId` is

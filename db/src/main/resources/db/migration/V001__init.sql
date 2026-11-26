@@ -25,7 +25,7 @@ CREATE TABLE workflow_instances (
 );
 
 COMMENT ON COLUMN workflow_instances.fencing_token IS
-  'The lease ownership identity, drawn from workflow_fencing_token_seq (never reset): every lease acquisition (including takeover of an expired lease) and every revocation (termination) advances it, so a token-only guard fences out any superseded run — including one paused across an instance''s deletion and recreation.';
+  'The lease ownership identity, drawn from workflow_fencing_token_seq (never reset): every lease acquisition (including takeover of an expired lease) and every revocation (reset, termination) advances it, so a token-only guard fences out any superseded run — including one paused across an instance''s deletion and recreation.';
 
 -- Ownership tokens must never repeat, not even across an instance's deletion
 -- and recreation (which resets the row to its defaults): a paused run of a

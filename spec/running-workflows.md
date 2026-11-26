@@ -169,7 +169,8 @@ Ownership of an instance's execution is a **lease on the instance row, not a row
 ```text
 fencing_token (bigint)   -- ownership identity, drawn from a database sequence
                          -- (never repeats): advanced on every lease acquisition
-                         -- and every revocation (recovery, termination)
+                         -- (including takeover of an expired lease) and every
+                         -- revocation (reset, termination)
 lease_expires_at (nullable timestamp)  -- liveness signal; NULL when unowned
 ```
 

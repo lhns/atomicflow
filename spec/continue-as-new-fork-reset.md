@@ -136,6 +136,11 @@ runtime.resetWorkflow(
 ```
 
 - Generation is incremented in place; no old generation is retained.
+- **Reset revokes the lease.** Like termination, it advances the fencing token
+  and clears the lease expiry, so a run that is live during the reset fails its
+  next write with `LeaseLostException` instead of writing over the reset, and
+  the re-run does not wait out the old lease. The generation only feeds child
+  scope derivation; fencing is the token alone.
 - The two invalidation lists follow the same rules as forking (at least one
   non-empty, both compound, selectors matching nothing are tolerated as long as
   some selector matches).

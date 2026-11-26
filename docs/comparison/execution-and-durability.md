@@ -192,7 +192,7 @@ WHERE workflow_id = :wf AND ...
 Zero rows updated → a live owner or a terminal instance; the acquirer backs off
 (an external `run` polls up to `leaseAcquireTimeout`). The fencing token doubles
 as the ownership identity: it is unique per claim, and every ownership change —
-each acquisition (including takeover of an expired lease), and each revocation by termination — advances
+each acquisition (including takeover of an expired lease), and each revocation by reset or termination — advances
 it, so the token-only guard below always detects a superseded writer. The token
 is drawn from a database sequence rather than incremented in place, so it never
 repeats across an instance's deletion and recreation.
