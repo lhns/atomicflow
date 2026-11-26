@@ -26,21 +26,43 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
   override def beforeEach(context: BeforeEach): Unit = {
     super.beforeEach(context)
     SharedPostgres.truncateAll(dataSource)
-    deadlocksBefore = deadlocks()
   }
 
-  /** Fails the test when the database recorded a deadlock during it, including
-    * one that `withDeadlockRetry` retried away (Postgres counts every one).
-    * The runtime opens a connection per transaction, so a victim's backend
-    * exits and flushes its statistics right away.
+  /** Checks run after every passing test body, as part of the test (munit
+    * does not report failures thrown from `afterEach`). Subclasses may add
+    * checks; call `super`.
     */
-  override def afterEach(context: AfterEach): Unit = {
-    val during = deadlocks() - deadlocksBefore
-    super.afterEach(context)
-    assertEquals(during, 0L, s"the database recorded $during deadlock(s) during this test")
+  protected def afterTestChecks(): Unit = checkDeadlocks()
+
+  override def munitTestTransforms: List[TestTransform] =
+    super.munitTestTransforms :+ new TestTransform(
+      "post-test checks",
+      t => t.withBodyMap(_.map { value => afterTestChecks(); value }(munitExecutionContext))
+    )
+
+  /** Logs the suite database's deadlock count, so a full run's log carries it
+    * (a failure here would not be reported by munit).
+    */
+  override def afterAll(): Unit = {
+    println(s"[deadlocks] ${getClass.getName}: ${deadlocks()}")
+    super.afterAll()
   }
 
-  private var deadlocksBefore: Long = 0L
+  /** Fails when the suite's database recorded a deadlock not yet reported,
+    * including one `withDeadlockRetry` retried away (Postgres counts every
+    * one). The database is fresh per suite, so the count starts at 0; a count
+    * whose statistics flush lags is reported by the next test.
+    */
+  private var deadlocksReported: Long = 0L
+
+  private def checkDeadlocks(): Unit = {
+    val now = deadlocks()
+    if (now > deadlocksReported) {
+      val fresh = now - deadlocksReported
+      deadlocksReported = now
+      fail(s"the database recorded $fresh new deadlock(s)")
+    }
+  }
 
   private def deadlocks(): Long = {
     val c = dataSource.getConnection
@@ -56,8 +78,10 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
   /** Instances nothing will ever run again: non-terminal, no wakeup row, no
     * live lease (against the database clock), and either a reason to run — a
     * direct signal past the cursor, a present completion, a timer at or past
-    * its deadline — or no subscription at all. Returns
-    * `(workflow id, key, scope, reason)`.
+    * its deadline — or no subscription at all after it has run. A created,
+    * never-run instance without a wakeup is excluded: `createWorkflowInstance`
+    * does not schedule by contract (manual mode), so that state is not stuck.
+    * Returns `(workflow id, key, scope, reason)`.
     */
   protected def stuckInstances(): Vector[(String, String, Vector[String], String)] =
     run(
@@ -91,7 +115,7 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
                 WHERE s.kind = 'timer' AND s.deadline <= now() AND s.workflow_id = i.workflow_id
                   AND s.workflow_instance_key = i.workflow_instance_key AND s.workflow_instance_scope = i.workflow_instance_scope)
                 THEN 'timer due'
-              WHEN NOT EXISTS (
+              WHEN i.times_executed > 0 AND NOT EXISTS (
                 SELECT 1 FROM workflow_subscriptions s
                 WHERE s.workflow_id = i.workflow_id AND s.workflow_instance_key = i.workflow_instance_key
                   AND s.workflow_instance_scope = i.workflow_instance_scope)

@@ -69,7 +69,8 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
   /** After each fault scenario and one pass of every background pass, no
     * instance may be left that nothing will ever run again.
     */
-  override def afterEach(context: AfterEach): Unit = {
+  override protected def afterTestChecks(): Unit = {
+    super.afterTestChecks()
     val rt = cleanRuntime()
     val runner = rt.startJobRunnerForTests(Seq.empty, JobRunnerSettings.forTests)
     try {
@@ -78,9 +79,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
       rt.dispatchNewEvents(1000)
       rt.scanAllSubscriptions()
     } finally runner.stop(1.second)
-    val stuck = stuckInstances()
-    super.afterEach(context)
-    assertEquals(stuck, Vector.empty, "instances left that nothing will run again")
+    assertEquals(stuckInstances(), Vector.empty, "instances left that nothing will run again")
   }
 
   private def stepState(
