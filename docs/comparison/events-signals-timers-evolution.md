@@ -41,7 +41,7 @@ status = DBOS.recv("payment_status", timeout_seconds=3600)
 | Returns a value | no | no | no |
 
 **Implementation.**
-- *AtomicFlow:* `sendSignal` briefly `SELECT ... FOR UPDATE`s the instance row,
+- *AtomicFlow:* `sendSignal` briefly `SELECT ... FOR NO KEY UPDATE`s the instance row,
   checks that it is not already terminal (`terminal_state IS NULL`), acquires the
   **global event-append advisory lock**, calls `nextval`, and inserts one
   immutable `Signal` row — no lease, no step mutation, no wakeup on the sender.

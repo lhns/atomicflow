@@ -59,7 +59,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private val transactor = Transactor.fromDataSource[IO](dataSource, executionContext)
 
   /** Well-known advisory-lock key for the global event-append protocol. */
-  private val EventAppendLockKey: Long = 844810493715605001L
+  private[atomicflow] val EventAppendLockKey: Long = 844810493715605001L
 
   private def clearInterrupt(): Unit = Thread.interrupted()
 
@@ -99,13 +99,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     loop(t)
   }
 
-  /** Bounded retry around a deadlockable pass. The two full-scan passes
-    * (`dispatchNewEvents`, `scanAllSubscriptions`) upsert wakeups for many
-    * instances in one transaction while a concurrent terminal transition /
-    * child-close upserts wakeups for other instances; the opposite lock orders
-    * over `workflow_instances` (FK KEY SHARE) and `workflow_wakeups` can raise
-    * SQLSTATE 40P01. Both passes are idempotent, so a bounded retry with a short
-    * backoff lets one side make progress and the retried pass succeed.
+  /** Bounded retry around a multi-instance pass. Single-instance transactions
+    * follow one lock order (the instance row first, the append lock last), but
+    * the bulk passes — `dispatchNewEvents` and `scanAllSubscriptions`, which
+    * upsert many instances' wakeups in one statement, and the child-close sweep's
+    * bulk delete of exhausted requests — lock rows of many instances in scan
+    * order, so two such passes (or one and a concurrent writer of the same rows)
+    * can still meet in opposite orders and raise SQLSTATE 40P01. They are
+    * idempotent, so a bounded retry lets the retried pass succeed.
     */
   private def withDeadlockRetry[A](fa: => A, attempts: Int = 5, backoffMillis: Long = 50L): A = {
     var attempt = 0
@@ -390,7 +391,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         sourceInput <- sql"""
           SELECT input FROM workflow_instances
           WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[String].option
         _ <- sourceInput match {
           case None =>
@@ -455,7 +456,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         row <- sql"""
           SELECT terminal_state, generation FROM workflow_instances
           WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[(Option[String], Long)].option
         generation = row.map(_._2).getOrElse(0L)
         _ <- row match {
@@ -685,8 +686,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * parent's own row (the caller is the parent's run) and requires the current
     * generation to equal the run's, so an orphaned pre-`continueAsNew` run can
     * never attach a stale-generation child after the successor generation — and
-    * after its closure record — has committed. The lock order (parent row, then
-    * the global event-append lock) matches the terminal transitions.
+    * after its closure record — has committed. Lock order: the parent (ancestor)
+    * row, then the new child row and its wakeup, then the global event-append
+    * lock last, like every other transaction.
     *
     * === Closing correctness guarantees ===
     *
@@ -746,7 +748,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT generation, terminal_state FROM workflow_instances
           WHERE workflow_id = ${parentId.workflowId} AND workflow_instance_key = ${parentId.workflowInstanceKey}
             AND workflow_instance_scope = ${parentId.scope}
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[(Long, Option[String])].option
         _ <- fence match {
           case Some((g, None)) if g == parentGeneration => ().pure[ConnectionIO]
@@ -776,26 +778,33 @@ class PostgresWorkflowRuntime private[atomicflow] (
           // event-append lock, so the replay cannot deadlock against the
           // child's own transactions).
           case Some(s) => (0, Some(s)).pure[ConnectionIO]
-          // First creation: the event-append protocol gives the child its
-          // inherited-events start sequence id. A raced insert (0 rows) falls
-          // back to the replay semantics below.
+          // First creation: insert the child and its wakeup, then take the
+          // event-append lock last (the lock order every transaction follows)
+          // and stamp the inherited-events start sequence id under it. A raced
+          // insert (0 rows) falls back to the replay semantics below.
           case None =>
             for {
-              _ <- takeEventAppendLock
-              maxSeq <- sql"SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events".query[Long].unique
               inserted <- sql"""
                 INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation, generation,
                   parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy,
-                  inherited_signal_prefixes, inherit_past_events, inherited_events_start_sequence_id)
+                  inherited_signal_prefixes, inherit_past_events)
                 VALUES ($childWorkflowId, $childKey, $derivedScope, $serializedInput, ${workflow.version}, 0,
                   ${parentId.workflowId}, ${parentId.workflowInstanceKey}, ${parentId.scope}, $policyStr,
-                  $inheritPrefixes, $inheritPastEvents, $maxSeq)
+                  $inheritPrefixes, $inheritPastEvents)
                 ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
               """.update.run
-              
+
               _ <- if (inserted == 1)
-                  upsertWakeupQ(childWorkflowId, childKey, derivedScope, clock.instant())
-                else 
+                  for {
+                    _ <- upsertWakeupQ(childWorkflowId, childKey, derivedScope, clock.instant())
+                    _ <- takeEventAppendLock
+                    _ <- sql"""
+                      UPDATE workflow_instances
+                      SET inherited_events_start_sequence_id = (SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events)
+                      WHERE workflow_id = $childWorkflowId AND workflow_instance_key = $childKey AND workflow_instance_scope = $derivedScope
+                    """.update.run
+                  } yield ()
+                else
                   ().pure[ConnectionIO]
               
               raced <- 
@@ -855,7 +864,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT terminal_state
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Option[String]].option
         _ <- row match {
           case None =>
@@ -1071,7 +1080,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * the number of children closed.
     */
   private[atomicflow] def closePendingChildClosures(limit: Int): Int = {
-    val candidates = withDeadlockRetry {
+    // A plain read: it takes no row locks, so it cannot deadlock.
+    val candidates =
       runTransaction {
         for {
           closable <-
@@ -1102,11 +1112,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
             """.query[(WorkflowId, WorkflowInstanceKey, ScopePath)].to[Vector]
         } yield closable.map(("closable", _)) ++ orphans.map(("orphan", _))
       }
-    }
     var closed = 0
     candidates.foreach { case (kind, (wf, k, s)) =>
-      val done =
-        withDeadlockRetry(runTransaction(closeOnePendingChildQ(wf, k, s, orphan = kind == "orphan")))
+      // Locks only the child row, then the child's wakeup: the single order.
+      val done = runTransaction(closeOnePendingChildQ(wf, k, s, orphan = kind == "orphan"))
 
       if (done) {
         faultInjector.afterChildClose()
@@ -1157,7 +1166,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state
         FROM workflow_instances
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-        FOR UPDATE
+        FOR NO KEY UPDATE
       """.query[
               (Option[String], Option[String], Option[ScopePath], Option[String], Option[String])
             ].option
@@ -1218,7 +1227,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT terminal_state, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[
                 (Option[String], Option[String], Option[String], Option[ScopePath], Option[String])
               ].option
@@ -1320,7 +1329,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT generation FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
             AND fencing_token = $token
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Long].option
         
         done <- locked match {
@@ -1376,7 +1385,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         terminal <- sql"""
           SELECT terminal_state, generation FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[(Option[String], Long)].option
 
         updated <- terminal match {
@@ -1397,9 +1406,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
               _ <- if (u == 1)
                   for {
                     _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
-                    _ <- appendCompletedEvent(workflowId, key, scope, payload)
                     _ <- terminalCleanupIO(workflowId, key, scope)
                     _ <- insertChildCloseRequestQ(workflowId, key, scope, generationScopePrefix(workflowId, key, scope, generation))
+                    _ <- appendCompletedEvent(workflowId, key, scope, payload)
                   } yield ()
                 else
                   ().pure[ConnectionIO]
@@ -1413,11 +1422,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   /** The timer-firing primitive shared by the scheduler sweep (Path 1) and await
-    * evaluation (Path 2): lock the subscription row, re-check that no
-    * `TimerFired` event exists yet, then append the event (global append mutex)
-    * and upsert the owning instance's wakeup, all in the caller's transaction.
-    * Returns whether it fired; a subscription that was concurrently retired or
-    * already fired is a no-op. The subscription row survives firing.
+    * evaluation (Path 2): lock the owning instance row (the lock order every
+    * instance transaction follows), then the subscription row, re-check that
+    * no `TimerFired` event exists yet, upsert the instance's wakeup and append
+    * the event last (the append lock is always the last lock taken). Returns
+    * whether it fired; a subscription that was concurrently retired or already
+    * fired is a no-op. The subscription row survives firing.
     */
   private[atomicflow] def fireTimerSubscriptionQ(
       timerId: java.util.UUID,
@@ -1427,12 +1437,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Boolean] = {
     val now = clock.instant()
     for {
+      _ <- sql"""
+        SELECT 1 FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+        FOR NO KEY UPDATE
+      """.query[Int].option
       locked <- sql"""
         SELECT deadline FROM workflow_timer_subscriptions
         WHERE timer_id = $timerId
         FOR UPDATE
       """.query[java.time.Instant].option
-      
+
       fired <- locked match {
         case None => false.pure[ConnectionIO]
 
@@ -1443,13 +1458,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
               WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                 AND event_kind = 'TimerFired' AND event_key = ${timerId.toString}
             """.query[Int].option
-            
+
             _ <- if (exists.isEmpty)
                 for {
-                  _ <- appendEvent(workflowId, key, scope, "TimerFired", timerId.toString, "")
                   _ <- upsertWakeupQ(workflowId, key, scope, now)
+                  _ <- appendEvent(workflowId, key, scope, "TimerFired", timerId.toString, "")
                 } yield ()
-              else 
+              else
                 ().pure[ConnectionIO]
           } yield exists.isEmpty
       }
@@ -1942,7 +1957,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         terminal <- sql"""
           SELECT terminal_state FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Option[String]].option
 
         restored <- terminal match {
@@ -2003,7 +2018,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT generation FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
             AND fencing_token = $token
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Long].option
 
         updated <- locked match {
@@ -2019,9 +2034,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
               _ <- if (u == 1)
                   for {
                     _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
-                    _ <- appendCompletedEvent(workflowId, key, scope, payload)
                     _ <- terminalCleanupIO(workflowId, key, scope)
                     _ <- insertChildCloseRequestQ(workflowId, key, scope, generationScopePrefix(workflowId, key, scope, generation))
+                    _ <- appendCompletedEvent(workflowId, key, scope, payload)
                   } yield ()
                 else
                   ().pure[ConnectionIO]
@@ -2116,7 +2131,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
   /** Appends a `Signal` event addressed to `workflowInstanceId`. In one
-    * transaction: row-lock the instance (`SELECT ... FOR UPDATE`), return
+    * transaction: row-lock the instance (`SELECT ... FOR NO KEY UPDATE`), return
     * [[WorkflowNotFoundException]] if absent or [[SignalSendResult.InstanceAlreadyCompleted]]
     * if it is already terminal (`terminal_state IS NOT NULL`), else append the
     * event (payload from the signal's [[Cacheable]]). The terminal transition
@@ -2139,7 +2154,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         terminal <- sql"""
           SELECT terminal_state FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = $scope
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Option[String]].option
         result <- terminal match {
           case None =>
@@ -2606,7 +2621,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT 1 FROM workflow_instances
           WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
             AND fencing_token = ${lease.fencingToken}
-          FOR UPDATE
+          FOR NO KEY UPDATE
         """.query[Int].option
         
         r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]

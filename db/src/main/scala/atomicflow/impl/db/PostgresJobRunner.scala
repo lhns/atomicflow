@@ -86,7 +86,10 @@ final class PostgresJobRunner private[atomicflow] (
     * of the queue with a fresh `created_at`.
     *
     * Exclude live leases so running instances cannot block the FIFO head.
-    * Conditional lease acquisition still guards against races.
+    * Conditional lease acquisition still guards against races. Both the wakeup
+    * and the instance row are locked with `SKIP LOCKED`, so the claim never
+    * waits on an instance while holding its wakeup (every other transaction
+    * locks the instance row first).
     */
   private def claimDueWakeups(): Vector[ClaimedInstance] = {
     val now = runtime.clock.instant()
@@ -103,6 +106,7 @@ final class PostgresJobRunner private[atomicflow] (
         ORDER BY w.created_at, w.workflow_instance_key
         LIMIT ${settings.wakeupBatchSize}
         FOR UPDATE OF w SKIP LOCKED
+        FOR NO KEY UPDATE OF i SKIP LOCKED
       """
     val claimed = runtime.runTransaction {
       for {

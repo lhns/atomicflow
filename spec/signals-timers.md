@@ -41,9 +41,11 @@ every timerSweepInterval:
          FOR UPDATE OF s SKIP LOCKED                        -- the claim (row lock, no delete)
   for each row, in its own transaction:
     BEGIN
-      re-check "no event exists" under the lock
-      pg_advisory_xact_lock(:eventSequenceLock)             -- normal event-append protocol
-      append TimerFired (nextval + INSERT); upsert wakeup of the owning instance
+      lock the owning instance row (FOR NO KEY UPDATE)      -- instance row first
+      lock the subscription row; re-check "no event exists"
+      upsert wakeup of the owning instance
+      pg_advisory_xact_lock(:eventSequenceLock)             -- append lock last
+      append TimerFired (nextval + INSERT)
     COMMIT
 ```
 

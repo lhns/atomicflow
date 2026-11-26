@@ -214,7 +214,7 @@ a lease expiring mid-step invites takeover and at-least-once re-execution of tha
 step (fenced writes still prevent corruption).
 
 **Targeted row locks** are used only for short critical sections:
-- *Signal acceptance*: `sendSignal` briefly `SELECT ... FOR UPDATE`s the instance
+- *Signal acceptance*: `sendSignal` briefly `SELECT ... FOR NO KEY UPDATE`s the instance
   row and checks that it is not already terminal (`terminal_state IS NULL`), so a
   signal can never be appended after the instance reaches its terminal
   transition.
