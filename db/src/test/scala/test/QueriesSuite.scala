@@ -43,7 +43,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     val info = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k1")).getInfo()
     assertEquals(info.id, WorkflowInstanceId(w.id, "k1"))
     assertEquals(info.parentId, None)
-    assertEquals(info.generation, 0L)
+    assertEquals(info.generation, generationOf(w.id, "k1"))
     assertEquals(info.terminalState, None)
     assertEquals(info.workflowVersionAtCreation, 7L)
     assertEquals(info.timesExecuted, 0)

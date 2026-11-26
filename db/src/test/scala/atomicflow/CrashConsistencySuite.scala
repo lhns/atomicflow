@@ -615,16 +615,18 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
       s"done-$in"
     }
     val id = rt.createWorkflowInstance(wf, "k", "start").id
+    val gen0 = generation(wf.id, "k")
 
     intercept[WorkflowTechnicalException](rt.runWorkflowInstance(wf, id))
 
-    assertEquals(generation(wf.id, "k"), 1L)
+    val gen1 = generation(wf.id, "k")
+    assert(gen1 != gen0, "the continue-as-new transition committed a new generation")
     assertEquals(stepCount(wf.id, "k"), 0, "the old generation's steps are erased")
     assertEquals(storedInput(wf.id, "k"), "next")
     assertEquals(wakeupCount(wf.id, "k"), 1, "the successor generation is scheduled")
 
     assertEquals(cleanRuntime().runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-next"))
-    assertEquals(generation(wf.id, "k"), 1L)
+    assertEquals(generation(wf.id, "k"), gen1)
   }
 
   test("afterReset commits the invalidation and a clean run replays and completes") {
@@ -649,12 +651,13 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(stepIds(wf.id, "k"), Set("A", "B"))
     assertEquals(executionsA.get(), 1)
     assertEquals(executionsB.get(), 1)
+    val gen0 = generation(wf.id, "k")
 
     intercept[WorkflowTechnicalException] {
       rt.resetWorkflow[String, String](id, Seq(stepId"/B"), Seq.empty)(using wf)
     }
 
-    assertEquals(generation(wf.id, "k"), 1L)
+    assert(generation(wf.id, "k") != gen0, "the reset committed a new generation")
     assertEquals(stepIds(wf.id, "k"), Set("A"), "the invalidated step is gone")
     assertEquals(wakeupCount(wf.id, "k"), 1, "the reset instance is scheduled")
 
@@ -672,7 +675,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
       s"parent-$in"
     }
     val id = rt.createWorkflowInstance(parentWf, "p", "in").id
-    val scope = ScopePath("crash-child-parent", "p@0")
+    val scope = ScopePath("crash-child-parent", s"p@${generationOf("crash-child-parent", "p")}")
 
     intercept[WorkflowTechnicalException](rt.runWorkflowInstance(parentWf, id))
 
@@ -701,7 +704,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope = ScopePath("crash-close-parent", "p@0")
+    val scope = ScopePath("crash-close-parent", s"p@${generationOf("crash-close-parent", "p")}")
     val childId = WorkflowInstanceId(childWf.id, "c", scope)
 
     val childRunner = rt.startJobRunnerForTests(Seq(childWf), JobRunnerSettings.forTests)
@@ -760,7 +763,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("parent-in"))
-    val scope = ScopePath("crash-selfcheck-parent", "p@0")
+    val scope = ScopePath("crash-selfcheck-parent", s"p@${generationOf("crash-selfcheck-parent", "p")}")
     val childId = WorkflowInstanceId(childWf.id, "c", scope)
     assertEquals(childCloseRequestCount(), 1, "the child has not run yet")
 

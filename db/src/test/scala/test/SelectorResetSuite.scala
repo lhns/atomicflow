@@ -109,8 +109,9 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "b", t2)
     setUpdatedAt(wf.id, "k", "c", t3)
 
+    val genBefore = handle.getInfo()(using rt).generation
     rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/b"))(using wf)
-    assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
+    assert(handle.getInfo()(using rt).generation != genBefore, "reset draws a new generation in place")
     assertEquals(stepIds(wf.id, "k"), Set("a"), "b and c are erased; a is kept")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
@@ -225,8 +226,9 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "c", t4)
     setUpdatedAt(wf.id, "k", "w", t5)
 
+    val genBefore = handle.getInfo()(using rt).generation
     rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/b"))(using wf)
-    assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
+    assert(handle.getInfo()(using rt).generation != genBefore, "reset draws a new generation in place")
     assertEquals(
       stepIds(wf.id, "k"),
       Set("a", "b"),

@@ -496,7 +496,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         // the re-run need not wait out the old lease.
         _ <- sql"""
           UPDATE workflow_instances
-          SET generation = generation + 1,
+          SET generation = nextval('workflow_generation_seq'),
               fencing_token = nextval('workflow_fencing_token_seq'), lease_expires_at = NULL
           WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
         """.update.run
@@ -781,10 +781,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
           case None =>
             for {
               inserted <- sql"""
-                INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation, generation,
+                INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation,
                   parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy,
                   inherited_signal_prefixes, inherit_past_events)
-                VALUES ($childWorkflowId, $childKey, $derivedScope, $serializedInput, ${workflow.version}, 0,
+                VALUES ($childWorkflowId, $childKey, $derivedScope, $serializedInput, ${workflow.version},
                   ${parentId.workflowId}, ${parentId.workflowInstanceKey}, ${parentId.scope}, $policyStr,
                   $inheritPrefixes, $inheritPastEvents)
                 ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
@@ -1343,7 +1343,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
               _ <- sql"""
                 UPDATE workflow_instances
-                SET input = $newSerializedInput, generation = generation + 1
+                SET input = $newSerializedInput, generation = nextval('workflow_generation_seq')
                 WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
               """.update.run
               _ <- upsertWakeupQ(workflowId, key, scope, now)

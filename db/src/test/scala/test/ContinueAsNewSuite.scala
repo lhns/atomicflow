@@ -99,15 +99,17 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     }
     val id = rt.createWorkflowInstance(wf, "k", "start").id
     val handle = rt.getWorkflowInstance(wf, id)
+    val gen0 = handle.getInfo()(using rt).generation
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.ContinueAsNew)
-    assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments on continueAsNew")
+    val gen1 = handle.getInfo()(using rt).generation
+    assert(gen1 != gen0, "continueAsNew draws a new generation")
     assertEquals(storedInput(wf.id, "k"), "next", "the new input is installed durably")
     assertEquals(countSteps(wf.id, "k"), 0, "old-generation step rows are erased")
     assertEquals(counter.get(), 1, "gen 0 executed step A once")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("final-next"))
-    assertEquals(handle.getInfo()(using rt).generation, 1L)
+    assertEquals(handle.getInfo()(using rt).generation, gen1)
     assertEquals(counter.get(), 2, "gen 1 re-ran step A from a fresh history")
     assertEquals(handle.getInfo()(using rt).terminalState, Some(WorkflowTerminalState.Completed))
   }
@@ -184,9 +186,10 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       Workflow.continueAsNew("next")
     }
     val parentId = rt.createWorkflowInstance(parentWf, "p", "start").id
+    val parentGen = generationOf("can-parent4", "p")
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.ContinueAsNew)
 
-    val scope = ScopePath("can-parent4", "p@0")
+    val scope = ScopePath("can-parent4", s"p@$parentGen")
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
     val cc = childRow(childWf.id, "cancel-child", scope).get
@@ -220,9 +223,10 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       "done"
     }
     val parentId = rt.createWorkflowInstance(parentWf, "p", "first").id
+    val parentGen = generationOf("can-parent3", "p")
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = ScopePath("can-parent3", "p@0")
+    val scope = ScopePath("can-parent3", s"p@$parentGen")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "cancel-child", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -250,9 +254,10 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       "parent-done"
     }
     val parentId = rt.createWorkflowInstance(parentWf, "p", "in").id
+    val parentGen = generationOf("can-parent5", "p")
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = ScopePath("can-parent5", "p@0")
+    val scope = ScopePath("can-parent5", s"p@$parentGen")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "c", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.ContinueAsNew)
 
@@ -304,6 +309,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       s"gen-input:$in"
     }
     val id = rt.createWorkflowInstance(wf, "k", "old-input").id
+    val genBefore = generationOf(wf.id, "k")
 
     run(
       sql"""
@@ -334,7 +340,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       run(sql"""
         SELECT generation FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.query[Long].unique),
-      1L,
+      genBefore + 1,
       "the run observed the newest generation"
     )
   }

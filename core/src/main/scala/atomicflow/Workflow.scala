@@ -216,7 +216,7 @@ object Workflow {
 
   /** Ends the current execution and restarts the
     * same logical workflow with `nextInput` and a fresh history, in place. The
-    * generation is incremented and the previous generation's execution records
+    * instance draws a new generation and the previous generation's execution records
     * (Step rows, subscriptions, wakeups) are erased; exact-key signal cursors
     * are kept. Children are closed per their `ParentClosePolicy`; the
     * continuation does not wait for cooperative child cancellation. If this

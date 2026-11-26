@@ -149,6 +149,18 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
   protected def run[A](program: ConnectionIO[A]): A =
     program.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
 
+  /** The current generation of an instance (default: top-level scope). Child
+    * scopes embed it as `key@generation`; it is drawn from a sequence, so tests
+    * read it instead of assuming a literal.
+    */
+  protected def generationOf(workflowId: String, key: String, scope: Vector[String] = Vector.empty): Long =
+    run(
+      sql"""
+        SELECT generation FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+      """.query[Long].unique
+    )
+
   /** A fresh runtime backed by the suite's single container. */
   def newRuntime: PostgresWorkflowRuntime =
     PostgresWorkflowRuntime(newDataSource)(using ExecutionContext.global)

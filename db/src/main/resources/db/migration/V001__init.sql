@@ -1,10 +1,15 @@
+-- Every incarnation of an instance generation (creation, reset,
+-- continue-as-new) draws a fresh value, so child scopes derived from it never
+-- repeat, not even across an instance's deletion and recreation.
+CREATE SEQUENCE workflow_generation_seq AS BIGINT;
+
 CREATE TABLE workflow_instances (
   workflow_id VARCHAR NOT NULL,
   workflow_instance_key VARCHAR NOT NULL,
   workflow_instance_scope VARCHAR[] NOT NULL,
   input VARCHAR NOT NULL,
   workflow_version_at_creation BIGINT NOT NULL,
-  generation BIGINT NOT NULL DEFAULT 0,
+  generation BIGINT NOT NULL DEFAULT nextval('workflow_generation_seq'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_run_at TIMESTAMPTZ,

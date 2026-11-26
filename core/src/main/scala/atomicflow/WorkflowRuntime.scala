@@ -36,7 +36,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
 
   /** Fork a source instance into a brand-new independent top-level instance.
     *
-    * The fork receives a completely new instance ID, generation 0, and the same
+    * The fork receives a completely new instance ID, its own generation, and the same
     * input as the source; it is an independent top-level workflow (no parent
     * relationship, no inherited signals). The invalidated steps — and, for
     * `invalidateAllExecutedAfter`, all executed steps at or after their

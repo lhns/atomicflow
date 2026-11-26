@@ -15,8 +15,13 @@ It returns `Nothing` and is implemented as runtime control flow, so the
 workflow body does not continue after the call.
 
 - The runtime updates the existing instance in place.
-- The generation is incremented and all Step rows, subscriptions, and other
+- A new generation is drawn and all Step rows, subscriptions, and other
   execution records from the old generation are erased (except for cursors).
+- Generations come from a database sequence (`workflow_generation_seq`): every
+  creation, reset and `continueAsNew` draws a fresh value. They are unique and
+  increasing but not consecutive, and never repeat — not even when an instance
+  is deleted and recreated (discard-existing), so a recreated parent's children
+  never collide with the old incarnation's children.
 - Older generations are not persisted separately.
 - The workflow key remains unique and unchanged. There are not multiple
   historical workflow instances with the same key.
@@ -26,7 +31,7 @@ workflow body does not continue after the call.
   records and directly addressed `Signal` events are removed, a
   `child_close_requests` row targeting exactly the closing generation's children
   is written in the dedicated `child_close_requests` table (keyed by the
-  parent's identity plus the target prefix), and the incremented generation and
+  parent's identity plus the target prefix), and the new generation and
   new input are installed as one durable in-place state transition. Current
   execution records include old await subscriptions and wakeups; pending
   `child_close_requests` rows live in their own table and survive the
@@ -41,7 +46,7 @@ workflow body does not continue after the call.
   them, delivered at each child's next run start or by the periodic child-close
   sweep. The continuation does not wait for cooperative child cancellation, and
   the parent's transition touches no child rows. Children of the successor
-  generation carry a distinct scope (`key@generation+1`) and are never matched
+  generation carry a distinct scope (`key@<new generation>`) and are never matched
   by the old generation's closure target.
 - Signals receive the same completion-boundary treatment as normal completion.
   The unconsumed `Signal` events are deleted inside the transition
@@ -88,7 +93,7 @@ runtime.forkWorkflow(
 ```
 
 - A fork always receives a completely new instance ID.
-- The fork has generation = 0 and starts with the same input as the source instance.
+- The fork draws its own generation and starts with the same input as the source instance.
 - A fork is an independent top-level workflow. It does not inherit the source
   workflow's parent relationship or inherited signals.
 - The fork takes two invalidation lists, both selectors (the `stepId`
@@ -135,7 +140,7 @@ runtime.resetWorkflow(
 )
 ```
 
-- Generation is incremented in place; no old generation is retained.
+- A new generation is drawn in place; no old generation is retained.
 - **Reset revokes the lease.** Like termination, it advances the fencing token
   and clears the lease expiry, so a run that is live during the reset fails its
   next write with `LeaseLostException` instead of writing over the reset, and
@@ -155,7 +160,7 @@ runtime.resetWorkflow(
   timestamp are erased.
 - **Reset closes all children of the old generation.** Like `continueAsNew`, the
   reset transaction records a `child_close_requests` row targeting exactly the
-  pre-increment generation's children (`parent identity + key@generation`),
+  pre-reset generation's children (`parent identity + key@generation`),
   delivered asynchronously per `ParentClosePolicy` (see
   `sub-workflows-iteration.md`). Children created before the reset boundary are
   closed; body replay recreates what is needed. A `startAsChild` inside a cached

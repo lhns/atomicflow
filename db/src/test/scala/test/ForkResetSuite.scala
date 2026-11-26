@@ -140,7 +140,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "C", t3)
 
     val fork = rt.forkWorkflow[String, String](sourceId, "fork", Seq.empty, Seq(stepId"/B"))(using wf)
-    assertEquals(fork.getInfo()(using rt).generation, 0L, "fork starts at generation 0")
+    assert(fork.getInfo()(using rt).generation != generationOf(wf.id, "k"), "the fork draws its own generation")
     assertEquals(storedInput(wf.id, "fork"), storedInput(wf.id, "k"), "fork carries the same input as the source")
     val (pw, pk, ps) = parentCols(wf.id, "fork")
     assertEquals((pw, pk, ps), (None, None, None), "fork is an independent top-level instance")
@@ -220,8 +220,9 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
+    val genBefore = handle.getInfo()(using rt).generation
     rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/B"))(using wf)
-    assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
+    assert(handle.getInfo()(using rt).generation != genBefore, "reset draws a new generation in place")
     assertEquals(stepIds(wf.id, "k"), Set("A"), "the selected step B and later step C are erased; A is kept")
     assertEquals(countWakeups(wf.id, "k"), 1, "a wakeup is scheduled so the instance re-runs")
     assertEquals(handle.getInfo()(using rt).terminalState, None)

@@ -87,7 +87,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope    = ScopePath("orders", "order-42@0")
+    val scope    = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId  = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -128,7 +128,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId  = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
-    val scope = ScopePath("orders", "order-42@0")
+    val scope = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(childRow("worker", "worker-1", scope).get.timesExecuted, 0, "the child never ran")
     assertEquals(childCloseRowCount(), 1)
@@ -163,7 +163,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -196,7 +196,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -229,7 +229,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope   = ScopePath("orders-park", "order-42@0")
+    val scope   = ScopePath("orders-park", s"order-42@${generationOf("orders-park", "order-42")}")
     val childId = WorkflowInstanceId("worker-park", "worker-1", scope)
 
     parentGate.send(parentId, "go")(using rt)
@@ -265,7 +265,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "gen0").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@0"))
+    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}"))
     assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
 
     parentGate.send(parentId, "go")(using rt)
@@ -273,7 +273,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
     // The successor generation starts its own child under a distinct scope.
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@1"))
+    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}"))
     assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
 
     assertEquals(childCloseRowCount(), 1, "continueAsNew records one closure request for the old generation")
@@ -311,13 +311,13 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
     // Iteration 0: child under processing@0, both suspended.
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@0", "processing@0"))
+    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}", "processing@0"))
     assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
 
     // Restart into iteration 1: child under processing@1.
     parentGate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@0", "processing@1"))
+    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}", "processing@1"))
     assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
 
     assertEquals(childCloseRowCount(), 1, "the restart records one closure request for the discarded interior")
@@ -351,7 +351,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -428,7 +428,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "w", scope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("HI"))
     assertEquals(childRow("worker", "w", scope).get.parentWf, Some("orders"),
@@ -493,7 +493,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     parentGate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "w", scope)
 
     // No sweep: the child's own first run applies the close, and the first
@@ -529,7 +529,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@0"))
+    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}"))
     assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
 
     // Reset from the executed `pre` step: the old generation's child must be closed.
@@ -544,7 +544,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
     // The successor generation starts its own child under a distinct scope.
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@1"))
+    val child1 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}"))
     assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
 
     sweep(childWf)
@@ -575,7 +575,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", "order-42@0"))
+    val child0 = WorkflowInstanceId("worker", "c", ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}"))
     assertEquals(childRow("worker", "c", child0.scope).get.timesExecuted, 0, "the child is CREATED and never ran")
 
     // Backdate the start-child step so it is strictly before the `post` boundary;
@@ -602,7 +602,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
         WHERE workflow_id = 'worker' AND workflow_instance_key = 'c' ORDER BY workflow_instance_scope
       """.query[Vector[String]].to[Vector]
     )
-    assertEquals(rows, Vector(Vector("orders", "order-42@0")),
+    assertEquals(rows, Vector(child0.scope.segments),
                  "the closed child is not recreated: exactly one instance row, the cancelled one")
   }
 
@@ -619,7 +619,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope   = ScopePath("orders", "order-42@0")
+    val scope   = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId = WorkflowInstanceId("worker", "c", scope)
 
     // Hold the child's row locked from a raw connection for the duration of the
@@ -666,7 +666,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope       = ScopePath("orders", "order-42@0")
+    val scope       = ScopePath("orders", s"order-42@${generationOf("orders", "order-42")}")
     val childId     = WorkflowInstanceId("worker", "c", scope)
     val childHandle = rt.getWorkflowInstance(childWf, childId)
 

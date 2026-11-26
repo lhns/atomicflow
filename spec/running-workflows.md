@@ -647,8 +647,8 @@ The public operation is available only inside an executing workflow through the 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
 2. One atomic transaction erases the current execution state (including old
    subscriptions and wakeups but not cursors), closes old child relationships,
-   deletes the directly addressed `Signal` events, increments the generation
-   counter, and persists `newInput`. Older generations are not retained
+   deletes the directly addressed `Signal` events, draws a new generation from
+   `workflow_generation_seq`, and persists `newInput`. Older generations are not retained
    separately.
 3. The new generation therefore starts with a **completely empty** set of Step
    rows, subscriptions, and directly addressed event rows. Exact-key signal

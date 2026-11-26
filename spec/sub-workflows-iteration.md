@@ -328,7 +328,8 @@ Application rules:
     parentInstanceScope ++ Vector(parentWorkflowId, s"$parentKey@$parentGeneration") ++ enclosingScopePath
   ```
   The `@count` / `@generation` marker is appended to the segment text
-  (`worker-1@0`), so the numeric count is part of the segment, never a
+  (`worker-1@0`; a generation is a sequence value, unique even across an
+  instance's deletion and recreation), so the numeric count is part of the segment, never a
   separate field. Injectivity is structural: a key crafted to look like a
   nested chain (say `x@0/B/y`) is a single array element `"x@0/B/y"`, which
   can never collide with the genuine chain `["x@0", "B", "y@0"]`. This is what
