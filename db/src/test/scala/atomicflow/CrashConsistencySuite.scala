@@ -521,6 +521,61 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(runs.get(), 1, "the terminal instance must not re-execute its body")
   }
 
+  test("a crash between a terminal commit and the after-commit wake leaves the completion subscriber to the full scan") {
+    val clean = cleanRuntime()
+    val target = Workflow[String, String](id = "crash-wake-target") { in => s"t-$in" }
+    val handle = clean.getWorkflowInstance(target, WorkflowInstanceId(target.id, "t"))
+    val waiter = Workflow[String, String](id = "crash-wake-waiter") { in =>
+      Step.await[WorkflowCompletionResult[String]]("wait", handle.completion) match {
+        case WorkflowCompletionResult.Completed(v) => s"got-$v"
+        case _                                     => "?"
+      }
+    }
+    val targetId = clean.createWorkflowInstance(target, "t", "in").id
+    val waiterId = clean.createWorkflowInstance(waiter, "w", "in").id
+    assertEquals(clean.runWorkflowInstance(waiter, waiterId), WorkflowRunResult.WorkflowSuspended)
+
+    val crashing = runtimeWith(FailingInjector("afterTerminalTransition"))
+    intercept[WorkflowTechnicalException](crashing.runWorkflowInstance(target, targetId))
+    assertEquals(terminalState(target.id, "t"), Some("completed"), "the terminal transition committed")
+    assertEquals(wakeupCount(waiter.id, "w"), 0, "the crash skipped the after-commit wake")
+
+    clean.scanAllSubscriptions()
+    assertEquals(wakeupCount(waiter.id, "w"), 1, "the full scan wakes the completion subscriber")
+    assertEquals(clean.runWorkflowInstance(waiter, waiterId), WorkflowRunResult.Result("got-t-in"))
+  }
+
+  test("a crash between a signal commit and the after-commit wake leaves the inheriting child to the full scan") {
+    val sig = Signal[String]("crash-wake-go")
+    val child = Workflow[String, String](id = "crash-wake-child") { in =>
+      s"got-${Step.await[String]("wait", Awaitable.SignalEvent(sig))}"
+    }
+    val parent = Workflow[String, String](id = "crash-wake-parent") { in =>
+      child.startAsChild("c", in, inheritSignals = SignalInheritance.all)
+      Step.await[String]("hold", Awaitable.SignalEvent(Signal[String]("crash-wake-never")))
+    }
+    val clean = cleanRuntime()
+    val parentId = clean.createWorkflowInstance(parent, "p", "in").id
+    assertEquals(clean.runWorkflowInstance(parent, parentId), WorkflowRunResult.WorkflowSuspended)
+    val childId = clean.getChildWorkflowInstances(parentId).head.id
+    assertEquals(clean.runWorkflowInstance(child, childId), WorkflowRunResult.WorkflowSuspended)
+    run(sql"DELETE FROM workflow_wakeups".update.run)
+
+    val crashing = runtimeWith(FailingInjector("afterEventAppendCommit"))
+    intercept[WorkflowTechnicalException](sig.send(parentId, "hi")(using crashing))
+    assertEquals(eventCount(parent.id, "p", "Signal"), 1, "the signal committed")
+    val childWakeups = run(
+      sql"""
+        SELECT COUNT(*) FROM workflow_wakeups
+        WHERE workflow_id = ${child.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = ${childId.scope.segments}
+      """.query[Int].unique
+    )
+    assertEquals(childWakeups, 0, "the crash skipped the after-commit wake of the inheriting child")
+
+    clean.scanAllSubscriptions()
+    assertEquals(clean.runWorkflowInstance(child, childId), WorkflowRunResult.Result("got-hi"))
+  }
+
   test("terminate commits cleanup of a suspended instance's real signal subscription before the fault") {
     val sig = Signal[String]("terminal-cleanup")
     val wf = Workflow[String, String](id = "crash-terminal-cleanup") { in =>

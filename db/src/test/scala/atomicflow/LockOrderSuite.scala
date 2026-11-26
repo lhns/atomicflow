@@ -49,6 +49,75 @@ class LockOrderSuite extends PostgresWorkflowRuntimeSuite {
     def join(): Unit = thread.join()
   }
 
+  /** Holds the append lock on a raw connection while `body` runs. */
+  private def withAppendGate[A](rt: atomicflow.impl.db.PostgresWorkflowRuntime)(body: java.sql.Connection => A): A = {
+    val gate = rawConnection
+    gate.setAutoCommit(false)
+    gate.createStatement().execute(s"SELECT pg_advisory_xact_lock(${rt.EventAppendLockKey})")
+    try body(gate)
+    finally gate.close()
+  }
+
+  test("a signal send and a run registering its subscription serialize on the instance row") {
+    val rt = newRuntime
+    val sig = Signal[String]("go")
+    val wf = Workflow[String, String](id = "lock-register-send") { in =>
+      s"got-${Step.await[String]("wait", Awaitable.SignalEvent(sig))}"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    withAppendGate(rt) { gate =>
+      // The send locks the instance row and queues on the append lock; the run
+      // then queues on the instance row behind it.
+      val send = new Worker("send")(rt.sendSignal(id, sig.key, "x"))
+      awaitCondition("the send blocks on the append lock")(blockedBackends() == 1)
+      val result = new AtomicReference[Option[WorkflowRunResult[String]]](None)
+      val run = new Worker("run")(result.set(Some(rt.runWorkflowInstance(wf, id))))
+      awaitCondition("the run blocks behind the send")(run.done || blockedBackends() == 2)
+      gate.rollback()
+      send.join()
+      run.join()
+      assertEquals(send.failure.get(), None)
+      assertEquals(run.failure.get(), None)
+      assertEquals(result.get(), Some(WorkflowRunResult.Result("got-x")), "the run sees the committed signal")
+    }
+  }
+
+  test("a child completing and its parent's inherited-signal send do not deadlock") {
+    val rt = newRuntime
+    val go = Signal[String]("go")
+    val done = Signal[String]("done")
+    val child = Workflow[String, String](id = "lock-child") { in =>
+      Step.awaitRace[String]("wait")("go" -> Awaitable.SignalEvent(go), "done" -> Awaitable.SignalEvent(done))
+    }
+    val parent = Workflow[String, String](id = "lock-parent") { in =>
+      val c = child.startAsChild("c", in, inheritSignals = SignalInheritance.all)
+      Step.await[WorkflowCompletionResult[String]]("wait-child", c.completion) match {
+        case WorkflowCompletionResult.Completed(v) => s"child-$v"
+        case _                                     => "?"
+      }
+    }
+    val parentId = rt.createWorkflowInstance(parent, "p", "in").id
+    assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.WorkflowSuspended)
+    val childId = rt.getChildWorkflowInstances(parentId).head.id
+    assertEquals(rt.runWorkflowInstance(child, childId), WorkflowRunResult.WorkflowSuspended)
+    done.send(childId, "d")(using rt)
+
+    withAppendGate(rt) { gate =>
+      // The parent's send holds the parent row (it will wake the inheriting
+      // child); meanwhile the child completes and wakes its parent.
+      val send = new Worker("send")(rt.sendSignal(parentId, go.key, "g"))
+      awaitCondition("the send blocks on the append lock")(blockedBackends() == 1)
+      val childRun = new Worker("child")(rt.runWorkflowInstance(child, childId))
+      awaitCondition("the child completes or blocks")(childRun.done || blockedBackends() == 2)
+      gate.rollback()
+      send.join()
+      childRun.join()
+      assertEquals(send.failure.get(), None)
+      assertEquals(childRun.failure.get(), None)
+    }
+    assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.Result("child-d"))
+  }
+
   test("timer sweep and sendSignal on the same instance do not deadlock") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)

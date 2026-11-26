@@ -21,6 +21,12 @@ import java.time.Clock
   */
 abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 
+  // Every round trip to the test database is slow in some environments (a
+  // remote Docker daemon: ~177 ms), so a test of a few dozen transactions plus
+  // the post-test checks can exceed munit's 30 s default without anything
+  // being wrong.
+  override val munitTimeout: scala.concurrent.duration.Duration = 120.seconds
+
   private lazy val dataSource: PGSimpleDataSource = SharedPostgres.newDatabase()
 
   override def beforeEach(context: BeforeEach): Unit = {
@@ -77,8 +83,9 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 
   /** Instances nothing will ever run again: non-terminal, no wakeup row, no
     * live lease (against the database clock), and either a reason to run — a
-    * direct signal past the cursor, a present completion, a timer at or past
-    * its deadline — or no subscription at all after it has run. A created,
+    * direct or inherited signal past the cursor, a completed target, a timer at
+    * or past its deadline that no run has handled — or no subscription at all
+    * after it has run. A created,
     * never-run instance without a wakeup is excluded: `createWorkflowInstance`
     * does not schedule by contract (manual mode), so that state is not stuck.
     * Returns `(workflow id, key, scope, reason)`.
@@ -102,6 +109,45 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
                     WHERE c.workflow_id = s.workflow_id AND c.workflow_instance_key = s.workflow_instance_key
                       AND c.workflow_instance_scope = s.workflow_instance_scope AND c.signal_key = s.signal_key), 0))
                 THEN 'signal past cursor'
+              WHEN EXISTS (
+                -- An inherited signal: an event on an eligible ancestor (each edge
+                -- permits the key, the ancestor is non-terminal and has not
+                -- closed the child's scope) after the cursor and, unless
+                -- inherit_past_events, after the inherited start sequence id.
+                WITH RECURSIVE anc(k, pfx, pwf, pkey, pscope, node_scope, src_wf, src_key, src_scope, depth) AS (
+                  SELECT s.signal_key, i.inherited_signal_prefixes, i.parent_workflow_id, i.parent_instance_key,
+                         i.parent_instance_scope, i.workflow_instance_scope,
+                         NULL::varchar, NULL::varchar, NULL::varchar[], 0
+                  FROM workflow_subscriptions s
+                  WHERE s.kind = 'signal' AND s.workflow_id = i.workflow_id AND s.workflow_instance_key = i.workflow_instance_key
+                    AND s.workflow_instance_scope = i.workflow_instance_scope
+                  UNION ALL
+                  SELECT a.k, p.inherited_signal_prefixes, p.parent_workflow_id, p.parent_instance_key,
+                         p.parent_instance_scope, p.workflow_instance_scope,
+                         p.workflow_id, p.workflow_instance_key, p.workflow_instance_scope, a.depth + 1
+                  FROM anc a
+                  JOIN workflow_instances p
+                    ON p.workflow_id = a.pwf AND p.workflow_instance_key = a.pkey AND p.workflow_instance_scope = a.pscope
+                  WHERE p.terminal_state IS NULL
+                    AND EXISTS (SELECT 1 FROM unnest(a.pfx) AS x(pf) WHERE starts_with(a.k, x.pf))
+                    AND NOT EXISTS (
+                      SELECT 1 FROM child_close_requests r
+                      WHERE r.workflow_id = p.workflow_id AND r.workflow_instance_key = p.workflow_instance_key
+                        AND r.workflow_instance_scope = p.workflow_instance_scope
+                        AND a.node_scope[1:array_length(r.scope_prefix, 1)] = r.scope_prefix)
+                )
+                SELECT 1 FROM anc a
+                JOIN workflow_events e
+                  ON e.workflow_id = a.src_wf AND e.workflow_instance_key = a.src_key
+                 AND e.workflow_instance_scope = a.src_scope AND e.event_key = a.k
+                WHERE a.depth > 0
+                  AND e.sequence_id > COALESCE((
+                    SELECT c.sequence_id FROM signal_cursor c
+                    WHERE c.workflow_id = i.workflow_id AND c.workflow_instance_key = i.workflow_instance_key
+                      AND c.workflow_instance_scope = i.workflow_instance_scope AND c.signal_key = a.k), 0)
+                  AND (i.inherit_past_events OR i.inherited_events_start_sequence_id IS NULL
+                       OR e.sequence_id > i.inherited_events_start_sequence_id))
+                THEN 'inherited signal past cursor'
               WHEN EXISTS (
                 SELECT 1 FROM workflow_subscriptions s
                 JOIN workflow_instances t
