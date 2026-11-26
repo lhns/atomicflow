@@ -326,7 +326,7 @@ Workflow tests deliberately do **not** start a JobRunner. The test is the driver
 
 ```scala
 // 1. Happy path with signal + timer — the virtual clock makes timers deterministic
-val rt = InMemoryWorkflowRuntime(clock = testClock)
+val rt = PostgresWorkflowRuntime(dataSource, testClock)
 val instanceId = WorkflowInstanceId(orderWf.id, "order-1")
 
 val r1 = orderWf.createAndRun("order-1", order)
@@ -360,7 +360,7 @@ assert(parentWf.run("p-1") == Result(allDone))
 
 - **The manual-mode contract**: no runner, no threads. Events delivered before a `run` always precede anything that run materializes — so `advanceBy` + `run` decides timer races deterministically. In runner mode the sweep pre-fires timers earlier; occurrence windows and race ordering rules are specified in `signals-timers.md` ("Timer firing: two paths, one primitive", "Racing signals/timers").
 - **Determinism guidance**: assert terminal states (`Result`, `WorkflowCancelled`, ...) and intermediate state via `Step.getStepState` (or `runtime.getStepState` from outside the body), `getInfo`, and stub counters — never mid-flight wall-clock timing. With no runner running, `WorkflowSuspended` between runs is itself a valid assertion.
-- **Recipe**: `InMemoryWorkflowRuntime(clock = testClock)` + retry threshold set low (workflow settings) so step retries become *durable* suspensions (driven by `advanceBy` + `run`) instead of inline `Thread.sleep`s. Start a real runner only for tests that specifically exercise scheduling behavior (coalescing, fairness, lease takeover): `rt.startJobRunner(definitions, JobRunnerSettings.forTests)`.
+- **Recipe**: `PostgresWorkflowRuntime(dataSource, testClock)` + retry threshold set low (workflow settings) so step retries become *durable* suspensions (driven by `advanceBy` + `run`) instead of inline `Thread.sleep`s. Start a real runner only for tests that specifically exercise scheduling behavior (coalescing, fairness, lease takeover): `rt.startJobRunner(definitions, JobRunnerSettings.forTests)`.
 - **Test execution**: `createAndScheduleForAsyncRun` requires a runner. Manual tests use `createAndRun` or `create` followed by explicit `run` calls. `blockUntilCompleted` only polls for completion; it times out if no runner or manual call advances a suspended instance. After `runtime.cancel`, the next `run` delivers cancellation before an uncached step or wait.
 
 ### Runtime-internal test hooks
