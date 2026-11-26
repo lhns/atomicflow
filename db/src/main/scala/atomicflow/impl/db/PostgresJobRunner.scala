@@ -207,52 +207,44 @@ final class PostgresJobRunner private[atomicflow] (
     latch.await()
   }
 
-  private final case class TimerSweepRow(
-      timerId: java.util.UUID,
-      workflowId: WorkflowId,
-      instanceKey: WorkflowInstanceKey,
-      scope: ScopePath
-  )
-
   private final case class InstanceRow(
       workflowId: WorkflowId,
       instanceKey: WorkflowInstanceKey,
       scope: ScopePath
   )
 
-  /** Fires a deadline-ordered batch of due timers across all workflow definitions.
-    * The selection is a plain read; each timer fires in its own transaction via
-    * [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]], which locks only the
-    * owning instance row, rechecks for an existing event and retains the
-    * subscription. Returns the fired count.
+  /** Wakes a deadline-ordered batch of instances with a due timer that no run
+    * has handled yet, across all workflow definitions. Wake-only: the woken
+    * run evaluates the timer against its stored deadline. `last_run_at` is the
+    * "already handled" marker — a run that started at or after the deadline
+    * has evaluated the timer or left it orphaned — and an existing wakeup means
+    * the instance is already scheduled. Each wake locks only the instance row,
+    * then upserts its wakeup. Returns the woken count.
     */
   private[atomicflow] def runTimerSweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
       fr"""
-        SELECT s.timer_id, s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope
+        SELECT i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope
         FROM workflow_subscriptions s
         JOIN workflow_instances i
           ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
         WHERE s.kind = 'timer' AND s.deadline <= $now
           AND i.terminal_state IS NULL
+          AND (i.last_run_at IS NULL OR i.last_run_at < s.deadline)
           AND NOT EXISTS (
-            SELECT 1 FROM workflow_events e
-            WHERE e.workflow_id = s.workflow_id AND e.workflow_instance_key = s.workflow_instance_key AND e.workflow_instance_scope = s.workflow_instance_scope
-              AND e.event_kind = 'TimerFired' AND e.event_key = s.timer_id::text
-          )
-        ORDER BY s.deadline
+            SELECT 1 FROM workflow_wakeups w
+            WHERE w.workflow_id = i.workflow_id AND w.workflow_instance_key = i.workflow_instance_key
+              AND w.workflow_instance_scope = i.workflow_instance_scope)
+        GROUP BY i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope
+        ORDER BY MIN(s.deadline)
         LIMIT ${settings.timerBatchSize}
       """
-        .query[TimerSweepRow].to[Vector]
+        .query[InstanceRow].to[Vector]
     }
-    var fired = 0
-    rows.foreach { row =>
-      if (runtime.fireTimerSubscription(row.timerId, row.workflowId, row.instanceKey, row.scope))
-        fired += 1
-    }
-    if (fired > 0) logger.debug(s"Timer sweep fired $fired due timers")
-    fired
+    rows.foreach(row => runtime.wakeInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
+    if (rows.nonEmpty) logger.debug(s"Timer sweep woke ${rows.size} instances with due timers")
+    rows.size
   }
 
   /** Cancellation escalation: turns instances whose `cancel_requested_at` is past

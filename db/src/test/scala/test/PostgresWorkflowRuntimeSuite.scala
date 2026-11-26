@@ -104,15 +104,16 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
                 THEN 'signal past cursor'
               WHEN EXISTS (
                 SELECT 1 FROM workflow_subscriptions s
-                JOIN workflow_events e
-                  ON e.workflow_id = s.completed_workflow_id AND e.workflow_instance_key = s.completed_workflow_instance_key
-                 AND e.workflow_instance_scope = s.completed_workflow_instance_scope AND e.event_kind = 'WorkflowCompleted'
+                JOIN workflow_instances t
+                  ON t.workflow_id = s.completed_workflow_id AND t.workflow_instance_key = s.completed_workflow_instance_key
+                 AND t.workflow_instance_scope = s.completed_workflow_instance_scope AND t.terminal_state IS NOT NULL
                 WHERE s.kind = 'completion' AND s.workflow_id = i.workflow_id AND s.workflow_instance_key = i.workflow_instance_key
                   AND s.workflow_instance_scope = i.workflow_instance_scope)
                 THEN 'completion present'
               WHEN EXISTS (
                 SELECT 1 FROM workflow_subscriptions s
-                WHERE s.kind = 'timer' AND s.deadline <= now() AND s.workflow_id = i.workflow_id
+                WHERE s.kind = 'timer' AND s.deadline <= now()
+                  AND (i.last_run_at IS NULL OR i.last_run_at < s.deadline) AND s.workflow_id = i.workflow_id
                   AND s.workflow_instance_key = i.workflow_instance_key AND s.workflow_instance_scope = i.workflow_instance_scope)
                 THEN 'timer due'
               WHEN i.times_executed > 0 AND NOT EXISTS (

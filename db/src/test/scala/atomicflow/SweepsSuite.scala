@@ -65,47 +65,33 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       """.query[Option[Instant]].unique
     )
 
-  private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
+  private def completedOutcome(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
       sql"""
-        SELECT event_kind, event_key, payload FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
-      """.query[
-          (String, String, String)
-        ].option
-    )
+        SELECT terminal_outcome FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND terminal_state IS NOT NULL
+      """.query[Option[String]].option
+    ).flatten
 
-  private def timerFiredEvents(workflowId: WorkflowId): Vector[(String, Long)] =
+  private def nonSignalEventCount(workflowId: WorkflowId): Int =
     run(
       sql"""
-        SELECT event_key, sequence_id FROM workflow_events
-        WHERE workflow_id = $workflowId AND event_kind = 'TimerFired'
-        ORDER BY sequence_id
-      """.query[(String, Long)].to[Vector]
+        SELECT COUNT(*) FROM workflow_events WHERE workflow_id = $workflowId AND event_kind <> 'Signal'
+      """.query[Int].unique
     )
 
   private def timerSubscriptions(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey
-  ): Vector[(java.util.UUID, Instant)] =
+  ): Vector[Instant] =
     run(
       sql"""
-        SELECT timer_id, deadline FROM workflow_subscriptions
+        SELECT deadline FROM workflow_subscriptions
         WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-      """.query[
-          (java.util.UUID, Instant)
-        ].to[Vector]
+      """.query[Instant].to[Vector]
     )
 
-  private def timerFiredCount(timerId: java.util.UUID): Int =
-    run(
-      sql"""
-        SELECT COUNT(*) FROM workflow_events
-        WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}
-      """.query[Int].unique
-    )
-
-  test("timer sweep fires a due timer of an unattended instance and upserts a wakeup") {
+  test("timer sweep wakes an unattended instance with a due timer; the run resolves the timer") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String](id = "ts-fire") { in =>
@@ -116,16 +102,17 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     try {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-      assertEquals(timerFiredEvents(wf.id), Vector.empty)
+      assertEquals(nonSignalEventCount(wf.id), 0)
 
       clock.advanceBy(2.minutes)
       assertEquals(runner.runTimerSweep(), 1)
 
-      val subId = timerSubscriptions(wf.id, "k").head._1
-      assertEquals(timerFiredCount(subId), 1, "the due timer must be fired exactly once")
+      assertEquals(timerSubscriptions(wf.id, "k").length, 1, "the sweep itself resolves nothing")
+      assertEquals(nonSignalEventCount(wf.id), 0, "the sweep appends no event")
       assert(wakeupExists(wf.id, "k"), "the sweep must upsert the owning instance's wakeup")
 
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"))
+      assertEquals(timerSubscriptions(wf.id, "k").length, 0, "the resolved timer's subscription is deleted")
     } finally runner.stop(1.second)
   }
 
@@ -141,8 +128,8 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
 
-      assertEquals(runner.runTimerSweep(), 0, "no timer is due, so nothing may fire")
-      assertEquals(timerFiredEvents(wf.id), Vector.empty)
+      assertEquals(runner.runTimerSweep(), 0, "no timer is due, so nothing may be woken")
+      assert(!wakeupExists(wf.id, "k"))
       assertEquals(timerSubscriptions(wf.id, "k").length, 1, "the subscription must survive")
     } finally runner.stop(1.second)
   }
@@ -158,16 +145,15 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     try {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-      val subId = timerSubscriptions(wf.id, "k").head._1
 
       clock.advanceBy(2.minutes)
       assertEquals(runner.runTimerSweep(), 1)
-      assertEquals(runner.runTimerSweep(), 0, "a second pass finds nothing new to fire")
-      assertEquals(timerFiredCount(subId), 1, "exactly one TimerFired event total")
+      assertEquals(runner.runTimerSweep(), 0, "a second pass finds the wakeup already present")
+      assertEquals(nonSignalEventCount(wf.id), 0)
     } finally runner.stop(1.second)
   }
 
-  test("timer sweep fires within a batch in deadline order") {
+  test("timer sweep wakes every due instance in a batch") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String](id = "ts-order") { in =>
@@ -184,12 +170,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       clock.advanceBy(5.minutes)
       assertEquals(runner.runTimerSweep(), 3)
 
-      val events = timerFiredEvents(wf.id)
-      assertEquals(events.size, 3)
-      val byKey = ids.map { case (k, id) => (k, timerSubscriptions(wf.id, k).head) }.toMap
-      val orderByDeadline = ids.map(_._1).sortBy(k => byKey(k)._2)
-      val orderBySequence = events.sortBy(_._2).map(e => byKey.find(_._2._1.toString == e._1).get._1)
-      assertEquals(orderBySequence, orderByDeadline, "append order must follow deadline order")
+      ids.foreach { case (k, _) => assert(wakeupExists(wf.id, k), s"instance $k must be woken") }
     } finally runner.stop(1.second)
   }
 
@@ -212,9 +193,9 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.runEscalationSweep(), 1)
 
       assertEquals(terminalRow(wf.id, "k").get._1, Some("terminated"))
-      val event = completedEvent(wf.id, "k").get
+      val outcome = completedOutcome(wf.id, "k").get
       assertEquals(
-        Cacheable[WorkflowCompletionResult[String]].read(event._3),
+        Cacheable[WorkflowCompletionResult[String]].read(outcome),
         WorkflowCompletionResult.Terminated
       )
     } finally runner.stop(1.second)
@@ -237,7 +218,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       clock.advanceBy(100.millis)
       assertEquals(runner.runEscalationSweep(), 0)
       assertEquals(terminalRow(wf.id, "k").get._1, None, "the instance must stay CANCELLING")
-      assertEquals(completedEvent(wf.id, "k"), None)
+      assertEquals(completedOutcome(wf.id, "k"), None)
     } finally runner.stop(1.second)
   }
 
@@ -261,7 +242,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
 
       clock.advanceBy(1.minute)
       assertEquals(runner.runEscalationSweep(), 0)
-      assertEquals(completedEvent(wf.id, "k").map(_._3), Some(Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Completed("out-in"))))
+      assertEquals(completedOutcome(wf.id, "k"), Some(Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Completed("out-in"))))
     } finally runner.stop(1.second)
   }
 
@@ -284,15 +265,11 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.runEscalationSweep(), 0)
       assertEquals(terminalRow(wf.id, "k").get._1, Some("terminated"))
       assertEquals(
-        run(
-          sql"""
-            SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
-          """.query[Int].unique
-        ),
-        1,
-        "only one WorkflowCompleted event may exist"
+        completedOutcome(wf.id, "k").map(Cacheable[WorkflowCompletionResult[String]].read),
+        Some(WorkflowCompletionResult.Terminated),
+        "the terminal outcome is set once"
       )
+      assertEquals(nonSignalEventCount(wf.id), 0)
     } finally runner.stop(1.second)
   }
 
@@ -435,7 +412,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("a due timer whose site is not reached on the next run is fired once and does not wake the instance again") {
+  test("a due timer whose site is not reached on the next run does not wake the instance again") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val sig = Signal[String]("go")
@@ -458,7 +435,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.lastClaimedBatch, Vector(id))
       assert(!wakeupExists(wf.id, "k"), "the run consumed the wakeup and suspended on the signal")
 
-      assertEquals(runner.runTimerSweep(), 0, "the orphaned timer already fired; it is not selected again")
+      assertEquals(runner.runTimerSweep(), 0, "the run started after the deadline; the orphaned timer is not selected again")
       runner.runDriverCycle()
       assertEquals(runner.lastClaimedBatch, Vector.empty, "nothing wakes the instance again")
       assert(!wakeupExists(wf.id, "k"))
@@ -515,8 +492,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(rt.runWorkflowInstance(unknown, id), WorkflowRunResult.WorkflowSuspended)
 
       clock.advanceBy(2.minutes)
-      assertEquals(runner.runTimerSweep(), 1, "the sweep fires the unknown workflow's timer")
-      assertEquals(timerFiredEvents(unknown.id).size, 1)
+      assertEquals(runner.runTimerSweep(), 1, "the sweep wakes the unknown workflow's instance")
       assert(wakeupExists(unknown.id, "u"), "the unknown workflow's wakeup is upserted")
 
       runner.runDriverCycle()

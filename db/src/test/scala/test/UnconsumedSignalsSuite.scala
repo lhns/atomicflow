@@ -19,18 +19,12 @@ class UnconsumedSignalsSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
   }
 
-  test("after completion the instance's Signal events are deleted; WorkflowCompleted remains; TimerFired survives") {
+  test("after completion the instance's Signal events are deleted; no non-Signal event is ever recorded") {
     val rt = newRuntime
     val signal = Signal[String]("A")
     val wf = Workflow[String, String](id = "uc-delete") { in => "done" }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     signal.send(id, "x")(using rt)
-    run(
-      sql"""
-        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key, payload, created_at)
-        VALUES (nextval('workflow_event_sequence'), 'TimerFired', ${wf.id}, 'k', '{}', 'timer1', '', now())
-      """.update.run
-    )
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
 
@@ -42,8 +36,7 @@ class UnconsumedSignalsSuite extends PostgresWorkflowRuntimeSuite {
       """.query[(String, Int)].to[Vector]
     ).toMap
     assertEquals(counts.getOrElse("Signal", 0), 0)
-    assertEquals(counts.getOrElse("WorkflowCompleted", 0), 1)
-    assertEquals(counts.getOrElse("TimerFired", 0), 1)
+    assertEquals(counts, Map.empty[String, Int], "the event log holds no non-Signal rows")
   }
 
   test("a signal sent to a created-but-never-started instance is deleted when the cancelled instance terminalizes") {
@@ -66,7 +59,7 @@ class UnconsumedSignalsSuite extends PostgresWorkflowRuntimeSuite {
       """.query[(String, Int)].to[Vector]
     ).toMap
     assertEquals(before.getOrElse("Signal", 0), 1, "the cancel flag alone does not delete the signal event")
-    assertEquals(before.getOrElse("WorkflowCompleted", 0), 0)
+    assertEquals(before.keySet, Set("Signal"))
 
     // The instance's own run delivers the cancellation at its first checkpoint;
     // the terminal transition deletes the directly addressed Signal events.
@@ -80,7 +73,7 @@ class UnconsumedSignalsSuite extends PostgresWorkflowRuntimeSuite {
       """.query[(String, Int)].to[Vector]
     ).toMap
     assertEquals(counts.getOrElse("Signal", 0), 0, "the cancelled instance's directly addressed Signal events are deleted")
-    assertEquals(counts.getOrElse("WorkflowCompleted", 0), 1)
+    assertEquals(counts.keySet.diff(Set("Signal")), Set.empty[String])
     assertEquals(signal.send(id, "late")(using rt), SignalSendResult.InstanceAlreadyCompleted)
   }
 }

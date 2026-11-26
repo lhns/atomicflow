@@ -39,13 +39,13 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
       """.query[(String, Long, String, String)].to[Vector]
     )
 
-  private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, java.util.UUID, Instant)] =
+  private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, Instant)] =
     run(
       sql"""
-        SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_subscriptions
+        SELECT step_id, step_version, subscriber_key, deadline FROM workflow_subscriptions
         WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
         ORDER BY step_id, subscriber_key
-      """.query[(String, Long, String, java.util.UUID, Instant)].to[Vector]
+      """.query[(String, Long, String, Instant)].to[Vector]
     )
 
   private def completionSubscriptions(
@@ -78,13 +78,11 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
       """.query[Long].unique
     )
 
-  private def timerFiredOrder(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
+  private def nonSignalEventCount(workflowId: WorkflowId): Int =
     run(
       sql"""
-        SELECT event_key FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-          AND event_kind = 'TimerFired' ORDER BY sequence_id
-      """.query[String].to[Vector]
+        SELECT COUNT(*) FROM workflow_events WHERE workflow_id = $workflowId AND event_kind <> 'Signal'
+      """.query[Int].unique
     )
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
@@ -116,10 +114,10 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(signalSubscriptions(wf.id, "k"), Vector(("race", 0L, "signal", "s")))
-    assertEquals(timerSubscriptions(wf.id, "k").map { case (s, v, l, _, _) => (s, v, l) }, Vector(("race", 0L, "timeout")))
+    assertEquals(timerSubscriptions(wf.id, "k").map { case (s, v, l, _) => (s, v, l) }, Vector(("race", 0L, "timeout")))
     assertEquals(completionSubscriptions(wf.id, "k"), Vector.empty)
     assertEquals(cursor(wf.id, "k", "s"), None)
-    assertEquals(timerFiredOrder(wf.id, "k"), Vector.empty)
+    assertEquals(nonSignalEventCount(wf.id), 0)
   }
 
   test("signal sent first wins the race over an also-due timer; only the signal cursor advances") {
@@ -144,7 +142,47 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(cursor(wf.id, "k", "s").get, seqOf(wf.id, "k", "s", "hello"))
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "both leaves' subscriptions are deleted on resolution")
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty)
-    assertEquals(timerFiredOrder(wf.id, "k").length, 1, "the due timer leaf was materialized but lost the race")
+    assertEquals(nonSignalEventCount(wf.id), 0)
+  }
+
+  test("a timer whose deadline precedes a signal wins even when the race is evaluated after the signal arrived") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val sig = Signal[String]("s")
+    var last = ""
+    val wf = Workflow[String, String](id = "race-deadline-order") { in =>
+      last = Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
+      TestControlFlow.suspend()
+      last
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+
+    // The signal is sent 2 minutes after the 1-minute deadline, before any run
+    // evaluates the race: the race compares the deadline with the send time.
+    clock.advanceBy(3.minutes)
+    sig.send(id, "late")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, "timeout")
+    assertEquals(cursor(wf.id, "k", "s"), None, "a losing signal does not advance its cursor")
+  }
+
+  test("a timer whose deadline equals the signal's send time wins the tie") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val sig = Signal[String]("s")
+    var last = ""
+    val wf = Workflow[String, String](id = "race-deadline-tie") { in =>
+      last = Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
+      TestControlFlow.suspend()
+      last
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    clock.advanceBy(1.minute)
+    sig.send(id, "tie")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, "timeout")
   }
 
   test("a timer that resolves before a later signal keeps the cached timer outcome") {
@@ -170,7 +208,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(last, "timeout", "the cached race result wins even though the signal arrived later")
   }
 
-  test("due timers of a race are materialized in deadline order; the earliest due timer wins") {
+  test("of several due timers of a race the earliest deadline wins") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     var last = ""
@@ -185,14 +223,13 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val (_, _, _, subT1, _) = timerSubscriptions(wf.id, "k")(0)
-    val (_, _, _, subT5, _) = timerSubscriptions(wf.id, "k")(1)
+    assertEquals(timerSubscriptions(wf.id, "k").map(_._3), Vector("t1", "t5"))
 
     clock.advanceBy(6.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
 
-    assertEquals(last, "t1", "the earliest deadline's fired event has the lowest sequenceId and wins")
-    assertEquals(timerFiredOrder(wf.id, "k"), Vector(subT1.toString, subT5.toString))
+    assertEquals(last, "t1", "the earliest deadline wins")
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "resolution deletes every leaf's subscription")
   }
 
   test("only the winning signal key's cursor advances; losing key's events survive for later awaits") {
@@ -241,7 +278,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(last, "x", "the cached result is reused rather than re-evaluating to the due timer")
-    assertEquals(timerFiredOrder(wf.id, "k"), Vector.empty, "no timer leaf is fired for a cached race")
+    assertEquals(nonSignalEventCount(wf.id), 0)
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty)
   }
 
@@ -306,7 +343,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(stepRow(wf.id, "k", "race").map(_._2), Some("Succeeded"))
   }
 
-  test("completion await: A suspends on B's completion; B completing wakes A; re-run resolves Completed(value)") {
+  test("completion await: A suspends on B's completion; B completing wakes A (wakeup upserted after the terminal commit); re-run resolves Completed(value)") {
     val rt = newRuntime
     val bWf = Workflow[String, String](id = "B") { in => in.toUpperCase }
     val bId = rt.createWorkflowInstance(bWf, "b", "hello").id
@@ -325,10 +362,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(completionSubscriptions(aWf.id, "a"), Vector(("wait-b", 0L, "", "B", "b", Vector.empty)))
 
     assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HELLO"))
-    assert(
-      !wakeupExists(aWf.id, "a"),
-      "completion wakeups are produced asynchronously by the job runner, not by the terminal transition"
-    )
+    assert(wakeupExists(aWf.id, "a"), "the terminal commit upserts the completion subscriber's wakeup")
 
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.Result("got:HELLO"))
     assertEquals(completionSubscriptions(aWf.id, "a"), Vector.empty)

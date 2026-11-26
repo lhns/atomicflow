@@ -42,7 +42,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     override def afterStepFailureWrite(): Unit = inject("afterStepFailureWrite")
 
     override def afterEventAppendCommit(): Unit = inject("afterEventAppendCommit")
-    override def afterTimerFireCommit(): Unit = inject("afterTimerFireCommit")
     override def afterSubscriptionRegistration(): Unit = inject("afterSubscriptionRegistration")
     override def afterWaitResolution(): Unit = inject("afterWaitResolution")
 
@@ -505,68 +504,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(evaluations.get(), 1, "the cached await result must not be re-evaluated")
   }
 
-  test("afterTimerFireCommit commits TimerFired without resolving the timer; a clean run resolves it") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val injector = new FailingInjector("afterTimerFireCommit")
-    val rt = runtimeWith(injector, clock)
-    val wf = Workflow[String, String](id = "crash-timer-fire") { in =>
-      Step.await[Unit]("t", Awaitable.Timer(1.minute))
-      s"done-$in"
-    }
-    val id = rt.createWorkflowInstance(wf, "k", "in").id
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-
-    clock.advanceBy(2.minutes)
-    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
-    try {
-      intercept[WorkflowTechnicalException](runner.runTimerSweep())
-
-      assertEquals(injector.hitCount("afterTimerFireCommit"), 1)
-      assertEquals(eventCount(wf.id, "k", "TimerFired"), 1)
-      assertEquals(wakeupCount(wf.id, "k"), 1, "the fired timer's wakeup committed before the fault")
-      assertEquals(timerSubscriptionCount(wf.id, "k"), 1, "the crashed sweep did not resolve the timer")
-      assertEquals(stepState(wf.id, "k", "t", stepVersion = 0L), None)
-      assertEquals(terminalState(wf.id, "k"), None)
-
-      assertEquals(runner.runTimerSweep(), 0, "the already-fired timer is not selected again")
-      assertEquals(injector.hitCount("afterTimerFireCommit"), 1,
-                   "a repeated sweep must not append or hook another TimerFired")
-      assertEquals(eventCount(wf.id, "k", "TimerFired"), 1)
-    } finally runner.stop(1.second)
-
-    val clean = cleanRuntime(clock)
-    assertEquals(clean.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"))
-    assertEquals(timerSubscriptionCount(wf.id, "k"), 0)
-  }
-
-  test("await-side timer firing runs afterTimerFireCommit before resolution") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val injector = new FailingInjector("afterTimerFireCommit")
-    val rt = runtimeWith(injector, clock)
-    val wf = Workflow[String, String](id = "crash-await-timer-fire") { in =>
-      Step.await[Unit]("t", Awaitable.Timer(1.minute))
-      s"done-$in"
-    }
-    val id = rt.createWorkflowInstance(wf, "k", "in").id
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-
-    clock.advanceBy(2.minutes)
-    intercept[WorkflowTechnicalException](rt.runWorkflowInstance(wf, id))
-
-    assertEquals(injector.hitCount("afterTimerFireCommit"), 1)
-    assertEquals(eventCount(wf.id, "k", "TimerFired"), 1)
-    assertEquals(wakeupCount(wf.id, "k"), 0,
-                 "await-side firing appends the event; this live run is the delivery vehicle")
-    assertEquals(timerSubscriptionCount(wf.id, "k"), 1, "the fault fired before the resolution transaction")
-    assertEquals(stepState(wf.id, "k", "t", stepVersion = 0L), None)
-
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"),
-                 "resuming with the same failing runtime must not re-fire the already-fired timer")
-    assertEquals(injector.hitCount("afterTimerFireCommit"), 1,
-                 "the already-fired timer must not fire the hook again")
-    assertEquals(timerSubscriptionCount(wf.id, "k"), 0)
-  }
-
   test("afterTerminalTransition commits terminal state and cleanup; a clean run decodes it without re-executing") {
     val rt = runtimeWith(FailingInjector("afterTerminalTransition"))
     val runs = new AtomicInteger(0)
@@ -578,7 +515,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(runs.get(), 1)
     assertEquals(terminalState(wf.id, "k"), Some("completed"))
     assert(terminalOutcome(wf.id, "k").isDefined)
-    assertEquals(eventCount(wf.id, "k", "WorkflowCompleted"), 1)
     assertEquals(wakeupCount(wf.id, "k"), 0, "terminal cleanup removes the wakeup")
 
     assertEquals(cleanRuntime().runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"))

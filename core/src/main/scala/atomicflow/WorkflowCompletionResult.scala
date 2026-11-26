@@ -3,7 +3,7 @@ package atomicflow
 import atomicflow.internal.Framing
 
 /** The terminal outcome of a workflow instance, as stored in the
-  * `WorkflowCompleted` event and awaited by parents (see `running-workflows.md`,
+  * terminal instance row (outcome and `terminal_at`) and awaited by parents (see `running-workflows.md`,
   * "Terminal outcome storage").
   *
   * `TERMINATED` is a real terminal state, not a flavor of cancellation: only

@@ -60,11 +60,11 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
       """.query[Int].unique
     )
 
-  private def countTimerEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
+  private def countNonSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""
         SELECT COUNT(*) FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'TimerFired'
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind <> 'Signal'
       """.query[Int].unique
     )
 
@@ -198,7 +198,8 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-2"))
-    assertEquals(countTimerEvents(wf.id, "k"), 3, "the timer fired once per iteration")
+    assertEquals(countNonSignalEvents(wf.id, "k"), 0, "timers resolve without events")
+    assertEquals(countTimerSubs(wf.id, "k"), 0, "every iteration's timer was resolved and retired")
     assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final iteration's await row remains")
   }
 

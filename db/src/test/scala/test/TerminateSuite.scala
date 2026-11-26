@@ -26,15 +26,13 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
         ].option
     )
 
-  private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
+  private def completedOutcome(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
       sql"""
-        SELECT event_kind, event_key, payload FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
-      """.query[
-          (String, String, String)
-        ].option
-    )
+        SELECT terminal_outcome FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND terminal_state IS NOT NULL
+      """.query[Option[String]].option
+    ).flatten
 
   private def cancelRequestedAt(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
@@ -273,7 +271,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(terminalRow(wf.id, "k").get._1, Some("completed"))
   }
 
-  test("terminate on a suspended instance: TERMINATED + event; wakeups/subscriptions deleted; body never runs on re-run") {
+  test("terminate on a suspended instance: TERMINATED; wakeups/subscriptions deleted; body never runs on re-run") {
     val rt = newRuntime
     val bodyCounter = new AtomicInteger(0)
     val sig = Signal[String]("approve")
@@ -295,9 +293,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     rt.terminate(id)
 
     assertEquals(terminalRow(wf.id, "k").get._1, Some("terminated"))
-    val event = completedEvent(wf.id, "k").get
-    assertEquals(event._1, "WorkflowCompleted")
-    assertEquals(Cacheable[WorkflowCompletionResult[String]].read(event._3), WorkflowCompletionResult.Terminated)
+    assertEquals(Cacheable[WorkflowCompletionResult[String]].read(completedOutcome(wf.id, "k").get), WorkflowCompletionResult.Terminated)
     assertEquals(countWakeups(wf.id, "k"), 0, "terminate must delete the wakeup row")
     assertEquals(countSignalSubs(wf.id, "k"), 0, "terminate must delete signal subscriptions")
     assertEquals(countTimerSubs(wf.id, "k"), 0, "terminate must delete timer subscriptions")
@@ -373,11 +369,10 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assert(errors(0).isInstanceOf[LeaseLostException], s"expected LeaseLostException, got: ${errors(0)}")
 
     assertEquals(terminalRow(wfId, "k").get._1, Some("terminated"))
-    val event = completedEvent(wfId, "k").get
     assertEquals(
-      Cacheable[WorkflowCompletionResult[String]].read(event._3),
+      Cacheable[WorkflowCompletionResult[String]].read(completedOutcome(wfId, "k").get),
       WorkflowCompletionResult.Terminated,
-      "the only WorkflowCompleted event is the terminator's; the losing run recorded no outcome"
+      "the terminal outcome is the terminator's; the losing run recorded no outcome"
     )
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowTerminated)
   }
@@ -398,7 +393,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     rt.terminate(id)
 
     assertEquals(terminalRow(wf.id, "k").get._1, Some("completed"))
-    assertEquals(completedEvent(wf.id, "k").map(_._1), Some("WorkflowCompleted"))
+    assertEquals(completedOutcome(wf.id, "k").map(Cacheable[WorkflowCompletionResult[String]].read(_)), Some(WorkflowCompletionResult.Completed("out-a")))
   }
 
   test("interrupt clearing: a body that interrupts itself still completes normally") {

@@ -796,20 +796,41 @@ object Step {
         branchOf(branchKey, underlying, now).map(f)
     }
 
-  /** Selects the earliest satisfying candidate across every branch by global
-    * `sequenceId`: candidates arrive sorted by `sequenceId`, so the first
-    * candidate accepted by its branch wins, and only the winner's value is
-    * serialized. Only a signal branch reports the cursor key to advance.
+  /** Selects the race winner:
+    *   1. the earliest accepted signal, by global `sequenceId` (signal
+    *      candidates are evaluated in that order and only until one is
+    *      accepted);
+    *   2. a due timer or a completion wins over it when its time (the stored
+    *      deadline, the target's `terminal_at`) is not later than that signal's
+    *      `createdAt`;
+    *   3. several due timers and completions are ordered by time, then by the
+    *      branches' declared order.
+    * Only the winner's value is serialized, and only a signal winner reports
+    * the cursor key to advance.
     */
   private def pickRaceWinner[A](
       valueCodec: Cacheable[A],
       branches: Vector[Branch[A]]
   ): Vector[SubscriberMatch] => Option[WaitResolution] = {
     val branchesByKey = branches.map(b => b.subscriber.key -> b).toMap
-    candidates =>
-      candidates.iterator
-        .flatMap(c => branchesByKey.get(c.subscriberKey).flatMap(_.accept(c)).map(c -> _))
+    val declaredOrder = branches.map(_.subscriber.key).zipWithIndex.toMap
+    def isSignal(c: SubscriberMatch): Boolean =
+      branchesByKey.get(c.subscriberKey).exists(_.subscriber.isInstanceOf[Subscriber.Signal])
+    def accepted(c: SubscriberMatch): Option[(SubscriberMatch, A)] =
+      branchesByKey.get(c.subscriberKey).flatMap(_.accept(c)).map(c -> _)
+    candidates => {
+      val (signals, timed) = candidates.partition(isSignal)
+      val firstSignal = signals.sortBy(_.sequenceId).iterator.flatMap(accepted).nextOption()
+      val firstTimed = timed
+        .sortBy(c => (c.createdAt, declaredOrder.getOrElse(c.subscriberKey, Int.MaxValue)))
+        .iterator
+        .flatMap(accepted)
         .nextOption()
+      val winner = (firstSignal, firstTimed) match {
+        case (Some(s), Some(t)) => if (t._1.createdAt.isAfter(s._1.createdAt)) Some(s) else Some(t)
+        case (s, t)             => s.orElse(t)
+      }
+      winner
         .map { case (candidate, value) =>
           WaitResolution(
             SerializedValue.of(tryOrThrowStepSerializationFailed(s"Subscriber '${candidate.subscriberKey}' result could not be encoded")(
@@ -821,6 +842,7 @@ object Step {
             }
           )
         }
+    }
   }
 
   /** The exceptions that may become a Step's durable outcome: ordinary failures,

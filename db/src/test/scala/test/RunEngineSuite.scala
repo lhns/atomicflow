@@ -23,15 +23,13 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
         ].option
     )
 
-  private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
+  private def completedOutcome(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
       sql"""
-        SELECT event_kind, event_key, payload FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
-      """.query[
-          (String, String, String)
-        ].option
-    )
+        SELECT terminal_outcome FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND terminal_state IS NOT NULL
+      """.query[Option[String]].option
+    ).flatten
 
   test("run on an unknown instance throws WorkflowNotFoundException") {
     val rt = newRuntime
@@ -41,7 +39,7 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("createAndRun completes: Result, terminal completed/outcome, WorkflowCompleted event") {
+  test("createAndRun completes: Result, terminal completed/outcome") {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "complete")(in => s"result-$in")
 
@@ -52,11 +50,11 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row._1, Some("completed"))
     assertEquals(row._2.map(Cacheable[WorkflowCompletionResult[String]].read(_)),
       Some(WorkflowCompletionResult.Completed("result-hello")))
-    val event = completedEvent(wf.id, "k").get
-    assertEquals(event._1, "WorkflowCompleted")
-    assertEquals(event._2, "")
-    assertEquals(Cacheable[WorkflowCompletionResult[String]].read(event._3),
-      WorkflowCompletionResult.Completed("result-hello"))
+    assert(
+      run(sql"""SELECT terminal_at FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".query[Option[java.time.Instant]].unique).isDefined,
+      "terminal_at is set with the terminal state"
+    )
+    assertEquals(completedOutcome(wf.id, "k"), row._2)
   }
 
   test("re-run of a completed instance returns equal Result without re-executing the body") {

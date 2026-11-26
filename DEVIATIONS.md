@@ -77,8 +77,7 @@ adds detail to, the documents in `spec/`.
   `state_kind` is `RetryPending` and carries the retry bookkeeping in
   `state_payload` plus the deadline in `retry_deadline`. Core compares that
   deadline against its clock to decide due-ness; the retry's timer subscription
-  is kept only to wake the instance at the deadline, and a fired retry
-  `TimerFired` event is never read by core.
+  is kept only so the timer sweep wakes the instance at the deadline.
 - `RetryPolicy.exponentialBackoff` is one method with both retry-count and
   cumulative-delay limits. Scala does not allow both proposed overloads to
   define default arguments.

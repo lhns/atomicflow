@@ -16,9 +16,9 @@ import scala.concurrent.duration.*
   * @param wakeupBatchSize
   *   max wakeups claimed per cycle
   * @param timerSweepInterval
-  *   cadence of the timer-firing sweep
+  *   cadence of the timer wake sweep (wakes instances with a due, unhandled timer)
   * @param timerBatchSize
-  *   max timers fired per sweep pass
+  *   max instances the timer sweep wakes per pass
   * @param sweepInterval
   *   cadence of the escalation and lease-recovery sweeps
   * @param eventDispatchBatchSize

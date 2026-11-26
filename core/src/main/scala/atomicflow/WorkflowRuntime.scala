@@ -173,7 +173,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
   def cancel(instanceId: WorkflowInstanceId): Unit
 
   /** Force-stop an instance. In one transaction: a guarded terminal transition to
-    * `TERMINATED` (appending the `WorkflowCompleted` event with a `Terminated`
+    * `TERMINATED` (recording the terminal row with a `Terminated`
     * outcome), a lease revocation (clearing the lease expiry and advancing the
     * fencing token, fencing out any running orphan), and terminal cleanup of this
     * instance's wakeup and subscription rows. The instance is never scheduled

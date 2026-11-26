@@ -16,6 +16,7 @@ CREATE TABLE workflow_instances (
   times_executed INT NOT NULL DEFAULT 0,
   terminal_state VARCHAR,
   terminal_outcome VARCHAR,
+  terminal_at TIMESTAMPTZ,
   cancel_requested_at TIMESTAMPTZ,
   fencing_token BIGINT NOT NULL DEFAULT 0,
   lease_expires_at TIMESTAMPTZ,
@@ -58,7 +59,7 @@ COMMENT ON COLUMN child_close_requests.scope_prefix IS
 
 CREATE TABLE workflow_events (
   sequence_id BIGINT PRIMARY KEY,
-  event_kind VARCHAR NOT NULL,
+  event_kind VARCHAR NOT NULL CHECK (event_kind = 'Signal'),
   workflow_id VARCHAR NOT NULL,
   workflow_instance_key VARCHAR NOT NULL,
   workflow_instance_scope VARCHAR[] NOT NULL,
@@ -68,10 +69,6 @@ CREATE TABLE workflow_events (
 );
 
 CREATE SEQUENCE workflow_event_sequence AS BIGINT CACHE 1;
-
-CREATE UNIQUE INDEX workflow_events_timer_unique
-  ON workflow_events (workflow_id, workflow_instance_key, workflow_instance_scope, event_key)
-  WHERE event_kind = 'TimerFired';
 
 CREATE INDEX workflow_events_lookup
   ON workflow_events (event_kind, event_key, workflow_id, workflow_instance_key, workflow_instance_scope, sequence_id);
@@ -122,7 +119,6 @@ CREATE TABLE workflow_subscriptions (
   subscriber_key VARCHAR NOT NULL,
   kind VARCHAR NOT NULL CHECK (kind IN ('signal', 'timer', 'completion')),
   signal_key VARCHAR,
-  timer_id UUID UNIQUE,
   deadline TIMESTAMPTZ,
   completed_workflow_id VARCHAR,
   completed_workflow_instance_key VARCHAR,
@@ -131,7 +127,7 @@ CREATE TABLE workflow_subscriptions (
     workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key
   ),
   CHECK ((kind = 'signal') = (signal_key IS NOT NULL)),
-  CHECK ((kind = 'timer') = (timer_id IS NOT NULL AND deadline IS NOT NULL)),
+  CHECK ((kind = 'timer') = (deadline IS NOT NULL)),
   CHECK ((kind = 'completion') = (
     completed_workflow_id IS NOT NULL AND completed_workflow_instance_key IS NOT NULL AND completed_workflow_instance_scope IS NOT NULL)),
   FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
@@ -140,7 +136,7 @@ CREATE TABLE workflow_subscriptions (
 );
 
 COMMENT ON TABLE workflow_subscriptions IS
-  'One row per pending await subscriber: the wait site (step id, scope, version) plus the subscriber key within it. kind selects the columns in use: signal_key for a signal, timer_id and the stored absolute deadline for a timer (timer_id is drawn per registration, so a re-registration after invalidation never matches an older TimerFired event), the completed_* identity for a workflow completion.';
+  'One row per pending await subscriber: the wait site (step id, scope, version) plus the subscriber key within it. kind selects the columns in use: signal_key for a signal, the stored absolute deadline for a timer (computed once at registration; a timer is due when this deadline has passed, and a re-registration after invalidation is a new row with a new deadline), the completed_* identity for a workflow completion (resolved from the target''s terminal row).';
 
 CREATE INDEX workflow_subscriptions_deadline
   ON workflow_subscriptions (deadline) WHERE kind = 'timer';

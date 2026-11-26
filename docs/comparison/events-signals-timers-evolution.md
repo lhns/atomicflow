@@ -88,11 +88,11 @@ progress = DBOS.get_event("order-123", "progress", timeout_seconds=30)
 **Implementation.** Every AtomicFlow wait site is a **runtime-computed step**
 evaluated by one protocol, `evaluateWait`:
 
-1. In one committed transaction, fire the site's own due **timer subscriptions**
-   (append `TimerFired`).
-2. In a second transaction, register every subscriber idempotently
-   (`ON CONFLICT DO NOTHING`), read all candidates, merge them sorted by global
-   `sequenceId`, and run the caller's `decide`. If `decide` resolves, persist the
+1. In one transaction, register every subscriber idempotently, read all
+   candidates (signal events after the cursor, timers whose stored deadline is
+   due, completed targets' terminal rows), and run the caller's `decide` (race
+   rule: earliest accepted signal by `sequenceId`, unless a due timer or
+   completion is not later than that signal's send time). If `decide` resolves, persist the
    step row, advance the winning signal cursor, and delete the site's
    subscriptions — **all atomically with registration and the candidate read**.
    If `decide` returns none, the registrations commit and the run suspends.
@@ -135,14 +135,11 @@ DBOS.sleep(1800)   # seconds
 
 **Implementation.** An AtomicFlow timer subscription is **semantic state, not a
 wakeup hint**: it stores the absolute deadline (so replays never push a timeout
-forward), schedules unattended instances, and versions the registration
-identity via `timer_id`. A due timer becomes durable through two paths sharing
-one primitive — the runner sweep and inline wait-site evaluation both *lock the
-subscription row, re-check that no `TimerFired` event exists, append it*. Firing
-does **not** delete the subscription; only the wait site's resolution does. This
-matters for invalidation: re-registering after `invalidateOn` creates a new
-`timer_id`, so the previous subscription's `TimerFired` event is
-inert. Temporal records a `StartTimer` event and a `TimerFired` event fired by the
+forward) and is the timer fact itself: a timer is due when that deadline has
+passed, with no firing event. The runner sweep only wakes instances with a due
+timer that no run has handled since the deadline; evaluation resolves it. Only
+the wait site's resolution deletes the subscription; re-registering after
+`invalidateOn` creates a new row with a new deadline. Temporal records a `StartTimer` event and a `TimerFired` event fired by the
 server. DBOS persists a wakeup time in the workflow row.
 
 ---

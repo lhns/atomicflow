@@ -34,15 +34,13 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
         ].option
     )
 
-  private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
+  private def completedOutcome(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
       sql"""
-        SELECT event_kind, event_key, payload FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
-      """.query[
-          (String, String, String)
-        ].option
-    )
+        SELECT terminal_outcome FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND terminal_state IS NOT NULL
+      """.query[Option[String]].option
+    ).flatten
 
   private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
@@ -75,10 +73,8 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
       terminalRow(wf.id, "k").get._2.map(Cacheable[WorkflowCompletionResult[String]].read(_)),
       Some(WorkflowCompletionResult.Cancelled)
     )
-    val event = completedEvent(wf.id, "k").get
-    assertEquals(event._1, "WorkflowCompleted")
     assertEquals(
-      Cacheable[WorkflowCompletionResult[String]].read(event._3),
+      Cacheable[WorkflowCompletionResult[String]].read(completedOutcome(wf.id, "k").get),
       WorkflowCompletionResult.Cancelled
     )
     assertEquals(
@@ -112,7 +108,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(terminalRow(wf.id, "k").get._1, Some("completed"))
     assertEquals(cancelRequestedAt(wf.id, "k"), None, "no cancel timestamp is set on a terminal instance")
-    assertEquals(completedEvent(wf.id, "k").map(_._1), Some("WorkflowCompleted"))
+    assertEquals(completedOutcome(wf.id, "k").map(Cacheable[WorkflowCompletionResult[String]].read(_)), Some(WorkflowCompletionResult.Completed("out-a")))
   }
 
   test("cancellation is delivered at the pending await; the cached step replays and the run returns WorkflowCancelled") {

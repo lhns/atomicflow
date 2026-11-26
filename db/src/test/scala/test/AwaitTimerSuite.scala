@@ -16,30 +16,18 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   private def timerSubscriptions(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey
-  ): Vector[(java.util.UUID, Instant)] =
+  ): Vector[Instant] =
     run(
       sql"""
-        SELECT timer_id, deadline FROM workflow_subscriptions
+        SELECT deadline FROM workflow_subscriptions
         WHERE kind = 'timer' AND workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-      """.query[
-          (java.util.UUID, Instant)
-        ].to[Vector]
+      """.query[Instant].to[Vector]
     )
 
-  private def timerFiredEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
+  private def nonSignalEventCount(workflowId: WorkflowId): Int =
     run(
       sql"""
-        SELECT event_key FROM workflow_events
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-          AND event_kind = 'TimerFired' ORDER BY sequence_id
-      """.query[String].to[Vector]
-    )
-
-  private def timerFiredCount(timerId: java.util.UUID): Int =
-    run(
-      sql"""
-        SELECT COUNT(*) FROM workflow_events
-        WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}
+        SELECT COUNT(*) FROM workflow_events WHERE workflow_id = $workflowId AND event_kind <> 'Signal'
       """.query[Int].unique
     )
 
@@ -55,11 +43,11 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
-    assertEquals(subs.head._2, Instant.parse("2026-01-02T00:05:00Z"))
-    assertEquals(timerFiredEvents(wf.id, "k"), Vector.empty)
+    assertEquals(subs.head, Instant.parse("2026-01-02T00:05:00Z"))
+    assertEquals(nonSignalEventCount(wf.id), 0)
   }
 
-  test("advancing past the deadline then re-running fires the timer inline and completes") {
+  test("advancing past the deadline then re-running resolves the timer inline and completes") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String](id = "timer-resolve") { in =>
@@ -69,16 +57,15 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val subId = timerSubscriptions(wf.id, "k").head._1
+    assertEquals(timerSubscriptions(wf.id, "k").length, 1)
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    assertEquals(timerFiredEvents(wf.id, "k"), Vector(subId.toString))
+    assertEquals(nonSignalEventCount(wf.id), 0, "resolution appends no event")
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the subscription is retired on resolution")
-    assertEquals(timerFiredCount(subId), 1)
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    assertEquals(timerFiredCount(subId), 1, "a terminal re-run must not fire again")
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "a terminal re-run registers nothing")
   }
 
   test("the deadline is stored once and never recomputed across re-runs") {
@@ -91,19 +78,19 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val d1 = timerSubscriptions(wf.id, "k").head._2
+    val d1 = timerSubscriptions(wf.id, "k").head
     assertEquals(d1, Instant.parse("2026-01-02T00:05:00Z"))
 
     clock.advanceBy(1.minute)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val d2 = timerSubscriptions(wf.id, "k").head._2
+    val d2 = timerSubscriptions(wf.id, "k").head
     assertEquals(d2, d1, "the deadline must not be recomputed on replay")
 
     clock.advanceBy(6.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
   }
 
-  test("exactly-once: firing never duplicates across repeated runs of a suspended flow") {
+  test("a resolved timer stays resolved across repeated runs of a suspended flow") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String](id = "timer-once") { in =>
@@ -114,15 +101,16 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val subId = timerSubscriptions(wf.id, "k").head._1
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(timerFiredCount(subId), 1)
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty)
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(timerFiredCount(subId), 1, "re-running a suspended-then-resolved flow must not fire again")
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty,
+                 "re-running a suspended-then-resolved flow must not register the timer again")
+    assertEquals(nonSignalEventCount(wf.id), 0)
   }
 
   test("the subscription persists while suspended and is deleted only when the await resolves") {
@@ -141,7 +129,7 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the subscription is deleted when the await resolves")
-    assertEquals(timerFiredEvents(wf.id, "k").length, 1, "the fired event survives the subscription")
+    assertEquals(nonSignalEventCount(wf.id), 0, "resolution leaves no event behind")
   }
 
   test("manual mode resolves a timer purely via run evaluation, with no sweep or runner") {
@@ -158,7 +146,7 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
   }
 
-  test("invalidateOn re-registers a fresh subscription; the old TimerFired is inert") {
+  test("invalidateOn re-registers a fresh subscription; the old deadline is not reused") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     var ctx = "A"
@@ -170,25 +158,22 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val (sub1, _) = timerSubscriptions(wf.id, "k").head
+    val d1 = timerSubscriptions(wf.id, "k").head
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(timerFiredCount(sub1), 1, "the old timer fired")
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the resolved await retired sub1")
 
     ctx = "B"
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
-    val (sub2, d2) = subs.head
-    assertNotEquals(sub2, sub1, "invalidation creates a new subscription id")
+    val d2 = subs.head
+    assertNotEquals(d2, d1, "invalidation registers a new deadline")
     assertEquals(d2, Instant.parse("2026-01-02T00:03:00Z"), "the deadline recomputes to now + delay")
-    assertEquals(timerFiredCount(sub2), 0, "the new subscription has no event of its own")
-    assertEquals(timerFiredCount(sub1), 1, "the old event remains but is not reused")
   }
 
-  test("invalidateAfter expiry re-registers a fresh subscription with a recomputed deadline; the old TimerFired is inert") {
+  test("invalidateAfter expiry re-registers a fresh subscription with a recomputed deadline; the old deadline is not reused") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String](id = "timer-ttl") { in =>
@@ -199,21 +184,18 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val (sub1, _) = timerSubscriptions(wf.id, "k").head
+    val d1 = timerSubscriptions(wf.id, "k").head
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(timerFiredCount(sub1), 1, "the old timer fired and resolved before the TTL expired")
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "resolution retired sub1")
 
     clock.advanceBy(20.seconds)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
-    val (sub2, d2) = subs.head
-    assertNotEquals(sub2, sub1, "cache expiry creates a new subscription")
+    val d2 = subs.head
+    assertNotEquals(d2, d1, "cache expiry registers a new deadline")
     assertEquals(d2, Instant.parse("2026-01-02T00:03:20Z"), "the deadline recomputes to now + delay")
-    assertEquals(timerFiredCount(sub2), 0, "the fresh subscription has no event of its own")
-    assertEquals(timerFiredCount(sub1), 1, "the old event remains but is inert")
   }
 }

@@ -195,15 +195,6 @@ object StepState {
     }
 }
 
-/** One durable `TimerFired` event matching a pending timer subscription of an
-  * awaiting site, keyed by the timer id.
-  */
-final case class AwaitTimerCandidate(
-    sequenceId: Long,
-    timerId: java.util.UUID,
-    createdAt: java.time.Instant
-)
-
 /** Identifies the step record where a wait's result will be stored, including
   * its input fingerprints and expiry.
   */
@@ -236,8 +227,11 @@ enum Subscriber {
   }
 }
 
-/** A stored event available to a wait's subscriber. Events from all subscribers
-  * are ordered by `sequenceId`, so the earliest matching event wins.
+/** A candidate available to a wait's subscriber: a stored signal event
+  * (`sequenceId`, payload, `createdAt` of the send), a due timer (`createdAt` is
+  * its stored deadline), or a completed target (`createdAt` is its
+  * `terminal_at`, the payload its stored outcome). `sequenceId` is meaningful
+  * only for signals; see the race rule in `Step.awaitRace`.
   */
 final case class SubscriberMatch(
     subscriberKey: String,

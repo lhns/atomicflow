@@ -148,19 +148,13 @@ trait WorkflowRuntimeInternals {
     */
   def readAwaitSignalCandidates(signalKey: SignalKey)(using Lease): Vector[SubscriberMatch]
 
-  /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
-    * own transaction, fire the site's own due timer subscriptions
-    * (`deadline <= now`) under the instance row lock of the fence, in deadline
-    * order (`ORDER BY deadline, timer_id`), appending a `TimerFired` event per
-    * due subscription that has none yet under the global append protocol (no
-    * wakeup upsert); this commits immediately, so a fired event persists even if
-    * the evaluation that follows rolls back (a re-fire on a later evaluation is
-    * an idempotent event-exists no-op). Then, in a second transaction, register
-    * every subscriber idempotently (an unchanged subscriber is left as is),
-    * preserving an existing timer subscription's timer id and stored deadline; read all
-    * subscribers' candidates and apply `decide` to the candidates merged across
-    * subscribers and sorted by global `sequenceId`. `decide` runs inside this
-    * second transaction while the instance row lock is held, so it must be fast
+  /** Evaluate a wait-site, fenced, in one transaction: register every
+    * subscriber idempotently (an unchanged subscriber is left as is),
+    * preserving an existing timer subscription's stored deadline; read all
+    * subscribers' candidates — signal events after the cursor, the site's
+    * timers whose stored deadline is due, completed targets' terminal rows —
+    * and apply `decide` to them. `decide` runs inside this
+    * transaction while the instance row lock is held, so it must be fast
     * and pure (no I/O, no blocking). If `decide` returns `Some(resolution)`,
     * persist the site's step row with state [[StepState.Await]] carrying the
     * winner, advance the winning
@@ -169,8 +163,7 @@ trait WorkflowRuntimeInternals {
     * and candidate read. If it returns `None`, commit the registrations and
     * advance each signal cursor past its examined, rejected events. Returns the
     * persisted payload when resolved, `None` when suspended. A `decide`
-    * exception rolls the evaluation transaction back entirely; the earlier fire
-    * transaction already committed.
+    * exception rolls the evaluation transaction back entirely.
     */
   def evaluateWait(
       waitSite: WaitSite,

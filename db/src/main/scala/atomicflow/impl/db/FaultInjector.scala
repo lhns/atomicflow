@@ -14,8 +14,10 @@ package atomicflow.impl.db
   *   - The step `afterX` hooks are state-specific: `afterStepStartedWrite` fires
   *     for a `Started` row, `afterStepSuccessWrite` for `Succeeded`, and
   *     `afterStepFailureWrite` for `Failed`.
-  *   - `afterTimerFireCommit` fires only when a timer transaction appended a new
-  *     `TimerFired` event. `afterSubscriptionRegistration` fires only when an
+  *   - `afterTerminalTransition` fires after the terminal commit and before
+  *     the after-commit wake of completion subscribers, so a throw there is a
+  *     crash between the two (the full scan then wakes them).
+  *   - `afterSubscriptionRegistration` fires only when an
   *     await transaction inserted at least one new subscription and did not
   *     resolve; `afterWaitResolution` fires when it resolved.
   *   - `afterLeaseAcquire` fires after lease acquisition (including the job
@@ -37,7 +39,6 @@ private[atomicflow] trait FaultInjector {
   def afterStepFailureWrite(): Unit = ()
 
   def afterEventAppendCommit(): Unit = ()
-  def afterTimerFireCommit(): Unit = ()
   def afterSubscriptionRegistration(): Unit = ()
   def afterWaitResolution(): Unit = ()
 

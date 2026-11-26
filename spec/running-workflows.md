@@ -146,9 +146,10 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 
 | Source | Upserts a wakeup when |
 |---|---|
-| Best-effort watermark dispatch | it processes an appended `Signal` past the stored watermark and a direct subscriber or eligible descendant subscription exists (its key matches), or a `WorkflowCompleted` past the watermark and completion subscribers exist (their wakeups — not the completing instance's) |
+| Best-effort watermark dispatch | it processes an appended `Signal` past the stored watermark and a direct subscriber or eligible descendant subscription exists (its key matches) |
+| After-commit completion wake | a terminal transition committed and completion subscribers of that instance exist (their wakeups — not the completing instance's); a separate transaction right after the commit, holding no instance row lock |
 | Full subscription scan | (periodic liveness pass) a non-terminal instance holds a pending signal or completion subscription with a visible, unconsumed candidate |
-| Timer firing | the sweep appended a `TimerFired` event for a due, not-yet-fired timer subscription |
+| Timer sweep | a timer subscription is due (`deadline <= now`) and no run started after its deadline (`last_run_at < deadline`) |
 | `cancel` | cancellation is requested (always, even with a live owner; a live owner observes the flag at its next checkpoint, and the wakeup remains if the run's last flag read raced the cancel) |
 | Parent-close `Cancel` | the child-close sweep delivers a `ParentClosePolicy.Cancel` request (always, even with a live owner); the run-start self-check sets the flag without a wakeup because its own live run is the delivery vehicle |
 | `createAndScheduleForAsyncRun` / `startAsChild` | schedules the first execution of a new instance |
@@ -262,12 +263,12 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 
 | Sweep | Predicate | Action |
 |---|---|---|
-| Timer firing | due, not-yet-fired timer subscriptions | per instance, under its row lock only: fire + upsert wakeup (mechanics: `signals-timers.md`, "Timer firing: two paths, one primitive") |
+| Timer wake | due timer subscriptions of non-terminal instances with `last_run_at IS NULL OR last_run_at < deadline` and no wakeup | per instance, under its row lock only: upsert wakeup; appends nothing (mechanics: `signals-timers.md`, "Timers: evaluation decides, the sweep only wakes") |
 | Cancellation escalation | `cancel_requested_at IS NOT NULL AND terminal_state IS NULL AND cancel_requested_at <= now() - cancelTimeout` | guarded `terminate` transition: `TERMINATED` outcome, lease revoked (fencing-token advance), wakeups deleted |
 | Lease recovery | `lease_expires_at IS NOT NULL AND lease_expires_at <= now() AND terminal_state IS NULL` | wake-only: upsert the wakeup; the claim's acquisition takes the expired lease over and advances `fencing_token` (fencing the crashed run out). The expiry is re-checked in the insert, so a lease renewed after selection is left alone. A terminal instance's stale lease is harmless (acquisition and claim exclude terminal instances) and is left as is |
 
 - The timer sweep processes due timers in deadline order within bounded batches (`timerBatchSize`), so timer catch-up (after downtime or mass registration) cannot starve signal and completion events.
-- **Timers progress without the sweep.** A manual run — no runner, no sweep — fires the await's own due timers during evaluation, so timer waits resolve correctly in manual mode too; the sweep exists only so *unattended* instances are noticed promptly. Mechanics in `signals-timers.md` ("Run semantics" above; "Timer firing: two paths, one primitive" there).
+- **Timers progress without the sweep.** A manual run — no runner, no sweep — reads the await's own due timers during evaluation, so timer waits resolve correctly in manual mode too; the sweep exists only so *unattended* instances are noticed promptly. Mechanics in `signals-timers.md` ("Run semantics" above; "Timer firing: two paths, one primitive" there).
 - The escalation sweep implements `cancelTimeout` ("Cancellation and termination") and is the only path that turns a stuck `CANCELLING` instance into `TERMINATED`.
 - Lease recovery bounds worker crashes: the re-enqueued instance is replayed from its Step cache, and the takeover's fencing-token advance fences the crashed run out. Recovery derives the wakeup from durable state (the expired lease), so a lost wakeup is regenerated.
 - The same sweep mechanism is the designated hook for future retention (auto-deletion of terminal instances).
@@ -314,9 +315,9 @@ case class JobRunnerSettings(
 - **The database is the coordinator.** No leader election, no external broker, no distributed scheduler state. Multi-process cooperation is conditional row updates — exactly the guarantee the storage backends already provide. Horizontal scaling is "start another process with a runner". The registry-filtered claim even allows different applications with different code to share the same tables.
 - **Fencing instead of mutual exclusion.** Leases must survive process crashes, so exclusivity is eventually consistent. The `fencing_token` makes stale writers harmless instead of assuming they are gone, which is what makes crash recovery a bounded, self-healing event.
 - **Sweeps are the liveness mechanism.** Every kind of durable pending state — wakeup row, due timer, overlong cancellation, expired lease — is discovered by a bounded, idempotent, leaderless sweep on a fixed cadence. For signal and completion wakeups the periodic full subscription scan is that mechanism: a suspended instance always has a subscription, and the scan catches any subscription committed concurrently with an event, so correctness needs no lost-wakeup reasoning on the writer's side.
-- **Manual runs can resolve waits.** Await evaluation reads stored events and fires its own due timers without a scheduler pass. Background jobs are needed to schedule unattended instances. Timer subscriptions retain the deadline and timer id needed by both manual and background evaluation; see `signals-timers.md`.
+- **Manual runs can resolve waits.** Await evaluation reads stored signal events, its own due timers and the awaited instances' rows without a scheduler pass. Background jobs are needed to schedule unattended instances. Timer subscriptions retain the deadline and timer id needed by both manual and background evaluation; see `signals-timers.md`.
 - **Sweeps are runtime operations, not sub-components.** Timer firing, cancellation escalation, and lease recovery are definition-agnostic operations of the runtime, driven on a cadence by the runner's loop. None is public API — await evaluation's self-sufficiency removes the need for on-demand firing, and escalation/recovery are never needed by caller threads. There is deliberately no way to manage sweeps as a separate component: a gateway needs no background machinery, and production always needs everything together.
-- **The sweep pre-fires timers for race predictability** — why, and how firing stays exactly-once, is specified in `signals-timers.md` ("Timer firing: two paths, one primitive"); this document only states the scheduling consequence above: manual mode progresses timers without any sweep.
+- **The timer sweep only wakes.** Timers are decided at evaluation from their stored deadlines (`signals-timers.md`, "Timers: evaluation decides, the sweep only wakes"); the race order compares deadlines and send times, so it does not depend on when the sweep runs. Manual mode progresses timers without any sweep.
 - **Runner and runtime are one implementation family.** The durable engine operations are methods of the implementer-facing `WorkflowRuntimeInternals` trait, each taking the run's opaque `Lease` handle; what both views deliberately omit are the runner-internal operations (wakeup claiming, lease acquisition, the sweeps), so a generic runner parameterized by the runtime views alone could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
 - **Registration on the runner, permissive call sites.** The executor is the only consumer that starts from an id alone, so the id→definition registry is passed to `startJobRunner`, lives on the runner object, and is validated once at start. Direct API calls keep working with any in-hand definition object; a workflow known to no runner anywhere surfaces through wakeup-age alerting instead of failing anywhere.
 
@@ -338,7 +339,7 @@ val r2 = orderWf.run("order-1")                      // consumes the signal, pro
 assert(r2 == WorkflowSuspended)                      // now waiting on the SLA timer
 
 testClock.advanceBy(31.minutes)
-val r3 = orderWf.run("order-1")                      // timer due → evaluation fires it inline
+val r3 = orderWf.run("order-1")                      // timer due → evaluation resolves it inline
 assert(r3 == Result(Escalated))                      //   → escalation branch runs
 assert(steps.chargeCount == 1)
 
@@ -358,7 +359,7 @@ kids.foreach(k => rt.getWorkflowInstance(workerWf, k.id).run())
 assert(parentWf.run("p-1") == Result(allDone))
 ```
 
-- **The manual-mode contract**: no runner, no threads. Events delivered before a `run` always precede anything that run materializes — so `advanceBy` + `run` decides timer races deterministically. In runner mode the sweep pre-fires timers earlier; occurrence windows and race ordering rules are specified in `signals-timers.md` ("Timer firing: two paths, one primitive", "Racing signals/timers").
+- **The manual-mode contract**: no runner, no threads. With a test clock, `advanceBy` + `run` decides timer races deterministically: the race compares stored deadlines with signal send times. The race rule is specified in `signals-timers.md` ("Racing signals/timers").
 - **Determinism guidance**: assert terminal states (`Result`, `WorkflowCancelled`, ...) and intermediate state via `Step.getStepState` (or `runtime.getStepState` from outside the body), `getInfo`, and stub counters — never mid-flight wall-clock timing. With no runner running, `WorkflowSuspended` between runs is itself a valid assertion.
 - **Recipe**: `PostgresWorkflowRuntime(dataSource, testClock)` + retry threshold set low (workflow settings) so step retries become *durable* suspensions (driven by `advanceBy` + `run`) instead of inline `Thread.sleep`s. Start a real runner only for tests that specifically exercise scheduling behavior (coalescing, fairness, lease takeover): `rt.startJobRunner(definitions, JobRunnerSettings.forTests)`.
 - **Test execution**: `createAndScheduleForAsyncRun` requires a runner. Manual tests use `createAndRun` or `create` followed by explicit `run` calls. `blockUntilCompleted` only polls for completion; it times out if no runner or manual call advances a suspended instance. After `runtime.cancel`, the next `run` delivers cancellation before an uncached step or wait.
@@ -416,9 +417,8 @@ the cancellation-timeout sweep query this predicate.
 Rules:
 
 - **Exactly one terminal transition.** The terminal update is conditional
-  (`WHERE terminal_state IS NULL`) and runs in the same transaction that
-  appends the `WorkflowCompleted` event, setting `terminal_state` and
-  `terminal_outcome` together. Concurrent attempts are serialized by the
+  (`WHERE terminal_state IS NULL`) and sets `terminal_state`,
+  `terminal_outcome` and `terminal_at` together. Concurrent attempts are serialized by the
   guarded update: exactly one wins; the loser's fenced write affects zero rows
   and the run aborts with `LeaseLostException` without recording its outcome —
   a later read or `run` adopts the winner's outcome. **The first terminal
@@ -426,24 +426,24 @@ Rules:
   catches a delivered cancellation and finishes normally is `COMPLETED` (with
   `cancel_requested_at` set) if its completion event lands first.
 - **Every resume path re-checks `terminal_state` before running user code** and
-  discards the execution if it is set. This is what makes late timer firings,
+  discards the execution if it is set. This is what makes late timer wakes,
   signal deliveries, child completions, and duplicate resume schedules harmless
   no-ops — including after cancellation and termination.
 - `run` on a terminal instance never executes the body.
 
 ## Terminal outcome storage
 
-The `WorkflowCompleted` event is the authoritative record of a terminal
-outcome. It is appended exactly once, for *every* terminal transition, whatever
-the reason — success, failure, cancellation, and termination alike. Its payload
-is the serialized `WorkflowCompletionResult[Out]` (below).
+The terminal instance row is the authoritative and only record of a terminal
+outcome. Every terminal transition, whatever the reason — success, failure,
+cancellation, and termination alike — sets it once:
 
-- The `terminal_outcome` column is a **projection** of that event: the same
-  serialized payload, written in the same transaction as the event and the
-  guarded status update. The event is truth; the column is a read cache for the
-  hot path (`run` on a terminal instance, child-completion awaits, monitoring
-  queries). If the column is ever lost, replaying the `WorkflowCompleted` event
-  reconstructs it.
+- `terminal_outcome` holds the serialized `WorkflowCompletionResult[Out]`
+  (below), `terminal_at` the transition time from the runtime clock. Completion
+  awaits read both: the payload is the awaited result, `terminal_at` its time in
+  the race rule (`signals-timers.md`, "Racing signals/timers").
+- No event is appended; completion subscribers are woken in a separate
+  transaction right after the commit, and the full subscription scan covers a
+  crash in between.
 - Invariant: `terminal_state` and the outcome case agree — `COMPLETED` ↔ `Completed`,
   `FAILED` ↔ `Failed`, `CANCELLED` ↔ `Cancelled`, `TERMINATED` ↔ `Terminated`.
 
@@ -557,15 +557,14 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
    rule).
 2. If the instance is currently **suspended** (no thread): Instance is scheduled for execution. When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `WorkflowCancelledException`. User code may catch this to run compensating code and then re-throw (or let it propagate).
 3. If the instance is currently **running**: Instance is scheduled for execution. The owner re-reads the durable flag around every Step and Await boundary — and at every explicit `Workflow.heartbeat()` call — and, when set, throws the same `WorkflowCancelledException` at that point. If the currently executing run already notices the cancellation and finishes the workflow, the job runner will notice in the future that the scheduled workflow is already finished and skip it. No thread is ever interrupted; delivery is a runtime throw, uniform with the suspended path.
-4. **Sticky redelivery.** If user code catches the `WorkflowCancelledException` and continues, the flag remains set and every subsequent cached checkpoint throws again. Catching it is for compensation, not for declining the cancel. The only way past it is to reach a terminal state — and if the workflow completes normally despite the pending cancel, the first-terminal-event rule applies: its `WorkflowCompleted` event wins and the instance is `COMPLETED`.
+4. **Sticky redelivery.** If user code catches the `WorkflowCancelledException` and continues, the flag remains set and every subsequent cached checkpoint throws again. Catching it is for compensation, not for declining the cancel. The only way past it is to reach a terminal state — and if the workflow completes normally despite the pending cancel, the first-terminal-transition rule applies: its guarded terminal update wins and the instance is `COMPLETED`.
 5. **Timeout escalation.** When an instance in the derived `CANCELLING` state (see "Instance lifecycle") stays non-terminal longer than the runtime-configured `cancelTimeout` — measured from `cancel_requested_at` — a background sweep escalates it to `terminate`. The timeout is a global runtime/job-runner option, not a per-instance field: a cancelling parent never waits for the children it is cancelling, so no child-side timeout declaration exists. It is a last line of defense and must be sized to allow long-running `uncancellable` Saga compensations to finish. Escalation produces `TERMINATED` (never scheduled again); an orphan thread still executing a Step is handled like any terminated instance (below).
 6. **Best-effort under non-determinism.** If the workflow body is non-deterministic, replay may diverge and take a checkpoint-free path, completing before cancellation is ever observed. The first-terminal-event rule then makes the instance `COMPLETED`. Workflow bodies should be deterministic (all non-determinism wrapped in Steps); this is the only boundary at which the cancel guarantee holds.
 
 ### `runtime.terminate(instanceId)` — force stop
 
 - Atomically flip DB state to `Terminated` via the guarded terminal transition
-  (which also appends the `WorkflowCompleted` event with a `Terminated`
-  outcome), revoke the lease, and never schedule the instance again. No resume
+  (which records a `Terminated` outcome and `terminal_at`), revoke the lease, and never schedule the instance again. No resume
   is scheduled and no `WorkflowCancelledException` is delivered — the body gets no
   chance to run.
 - Directly addressed `Signal` events are deleted in the same transition. There

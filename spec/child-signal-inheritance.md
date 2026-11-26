@@ -47,7 +47,7 @@ workerWorkflow.startAsChild(
 ## Events and ordering
 
 - Signals are immutable `workflow_events` facts. The same global event sequence
-  also stores `TimerFired` and `WorkflowCompleted` events. Events are never
+  holds signals only (timers and completions are not events). Events are never
   updated in place, but lifecycle cleanup may delete them.
 - Each event has one global `sequenceId`, the workflow instance it belongs to,
   its non-null key, payload, and creation time. `sequenceId` is unique across
