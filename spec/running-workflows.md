@@ -183,16 +183,16 @@ lease_expires_at (nullable timestamp)  -- liveness signal; NULL when unowned
     AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
   ```
   Zero rows updated means a live owner or a terminal instance; the acquirer backs off. The token is the ownership identity: at most one claim can hold the current token, and every ownership change (acquire or revocation) advances it, so a token-only guard always detects a stale writer. Drawing the token from a sequence — rather than incrementing the column — is what makes that guard safe across an instance's deletion and recreation (discard-existing and prefix deletes reset the row to its defaults; a sequence never resets).
-- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread and the runtime does not renew the lease on its own; renewal happens only when the workflow's own thread calls `Workflow.heartbeat()`. `leaseDuration` must therefore exceed the longest gap between such calls. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+- **Renewal — every fenced write, plus `Workflow.heartbeat`.** There is no background heartbeater thread. The fence of every lease-checked transaction (step writes, await evaluation, child starts, scope cleanup) is itself the renewal: `UPDATE workflow_instances SET lease_expires_at = :now + :leaseDuration WHERE … AND fencing_token = :token RETURNING 1`, with `:now` from the runtime clock. A run that keeps writing therefore never loses its lease; `Workflow.heartbeat()` covers Step bodies that run longer than `leaseDuration` between writes. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate. The runtime's `leaseDuration` is the only one: the job runner's claim uses it too.
 
 **`Workflow.heartbeat()` — public lease renewal**
 
 ```scala
 object Workflow {
   /** Renews the execution lease of the instance executing on the current thread,
-    * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime does not renew the lease on its own; call this explicitly inside
-    * long-running Step bodies.
+    * extending its `lease_expires_at` by the runtime's `leaseDuration`. Every
+    * fenced write renews it too; call this inside Step bodies that run longer
+    * than `leaseDuration` between writes.
     *
     * Also observes cancellation: when `cancel_requested_at` is set, throws
     * `WorkflowCancelledException` instead of renewing, unless the call is
@@ -202,13 +202,13 @@ object Workflow {
 }
 ```
 
-- Renewal is a **fenced write that does not bump the fencing token**:
+- Renewal is a **fenced write that does not bump the fencing token** — the same fence every lease-checked transaction starts with:
   ```sql
   UPDATE workflow_instances
   SET lease_expires_at = :now + :leaseDuration
   WHERE workflow_instance_id = :id
     AND fencing_token = :token
-    AND terminal_state IS NULL
+  RETURNING 1
   ```
   Zero rows updated → the runtime raises `LeaseLostException` and aborts the run without durable effect, identical to any other fenced-write loss.
 - **Heartbeat observes cancellation.** Before renewing, heartbeat re-reads the durable `cancel_requested_at` flag. When it is set, heartbeat throws `WorkflowCancelledException` instead of renewing — an explicit delivery point that lets a long-running Step body act on a pending cancel without waiting for the next new-work checkpoint. Sticky redelivery applies unchanged: catching the exception and calling heartbeat again throws again.
@@ -298,7 +298,6 @@ case class JobRunnerSettings(
   sweepInterval: FiniteDuration,        // escalation + recovery sweeps
   eventDispatchBatchSize: Int,          // best-effort watermark dispatch: max events per driver cycle (default 1000)
   fullSubscriptionScanInterval: FiniteDuration, // periodic full subscription scan; the liveness guarantee (default 1 minute)
-  leaseDuration: FiniteDuration,        // must exceed the longest gap between Workflow.heartbeat calls
   leaseAcquireTimeout: FiniteDuration,  // wait bound for external run on a leased instance
   cancelTimeout: FiniteDuration,
 )

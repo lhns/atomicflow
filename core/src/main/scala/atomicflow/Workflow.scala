@@ -186,10 +186,10 @@ object Workflow {
     )
 
   /** Renews the execution lease of the instance executing on the current thread,
-    * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime does not renew the lease on its own; call this explicitly inside
-    * long-running Step bodies, and ensure `leaseDuration` exceeds the longest
-    * gap between calls.
+    * extending its `lease_expires_at` by the runtime's `leaseDuration`. Every
+    * durable write of the run (step rows, awaits, child starts) renews the lease
+    * too, so a run that keeps making progress keeps its lease; call this inside
+    * Step bodies that run longer than `leaseDuration` between such writes.
     *
     * Heartbeat also observes cancellation: when `cancel_requested_at` is set, it
     * throws [[WorkflowCancelledException]] instead of renewing, giving a

@@ -112,7 +112,7 @@ final class PostgresJobRunner private[atomicflow] (
       for {
         rows <- query.query[DueWakeupRow].to[Vector]
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
-          runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope, settings.leaseDuration).flatMap {
+          runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope).flatMap {
             case Some(token) =>
               sql"""
                     DELETE FROM workflow_wakeups

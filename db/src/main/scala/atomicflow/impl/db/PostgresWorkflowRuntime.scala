@@ -1644,7 +1644,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       case Some(_) => LeasedRunResult.AlreadyTerminal(initial)
 
       case None =>
-        val token = acquireLease(workflowId, key, scope, leaseDuration, acquireTimeout) match {
+        val token = acquireLease(workflowId, key, scope, acquireTimeout) match {
           case Some(t) => t
           case None    => throw LeaseUnavailableException(instance)
         }
@@ -1847,8 +1847,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private[atomicflow] def tryAcquireLeaseQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: ScopePath,
-      leaseDuration: FiniteDuration
+      scope: ScopePath
   ): ConnectionIO[Option[Long]] = {
     val now = clock.instant()
     val expires = leaseExpiry(now, leaseDuration)
@@ -1869,14 +1868,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
-      leaseDuration: FiniteDuration,
       leaseAcquireTimeout: FiniteDuration
   ): Option[Long] = {
     val pollIntervalMillis = 100L
     val deadlineNanos = System.nanoTime() + leaseAcquireTimeout.toNanos
     var acquired: Option[Long] = None
     while (acquired.isEmpty && System.nanoTime() < deadlineNanos) {
-      acquired = runTransaction(tryAcquireLeaseQ(workflowId, key, scope, leaseDuration))
+      acquired = runTransaction(tryAcquireLeaseQ(workflowId, key, scope))
       if (acquired.isEmpty && System.nanoTime() < deadlineNanos)
         Thread.sleep(pollIntervalMillis)
     }
@@ -2572,31 +2570,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }.isDefined
   }
 
-  override def renewLease()(using lease: Lease): Unit = {
-    val now = clock.instant()
-    val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
-    val updated = runTransaction {
-      sql"""
-        UPDATE workflow_instances
-        SET lease_expires_at = $expires
-        WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-          AND fencing_token = ${lease.fencingToken}
-          AND terminal_state IS NULL
-      """.update.run
-    }
-    if (updated != 1) throw LeaseLostException(lease.instanceId)
-  }
+  /** A lease-checked transaction with nothing else in it: the fence renews
+    * the lease. For Step bodies that run longer than `leaseDuration` between
+    * fenced writes.
+    */
+  override def renewLease()(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease)(().pure[ConnectionIO])
 
-  /** Runs `write` inside one transaction, guarded by an exclusive lock on the
-    * instance row and a fencing check in one statement; throws
+  /** Runs `write` inside one transaction, guarded by a lock on the instance row
+    * and a fencing check in one statement, which also renews the lease; throws
     * [[LeaseLostException]] if the lease no longer belongs to this run (or the
     * instance row is gone), affecting no rows. Callers that do not need the
     * result simply discard it.
     *
-    * The lock and the fence share one `SELECT ... FOR UPDATE`: under READ
-    * COMMITTED Postgres re-checks the `WHERE` clause against the latest row
-    * version after acquiring the lock, so a row that no longer records this
-    * run's token matches no rows. The token changes on every ownership change —
+    * The lock, the fence and the renewal share one `UPDATE ... RETURNING`:
+    * under READ COMMITTED Postgres re-checks the `WHERE` clause against the
+    * latest row version after acquiring the row lock, so a row that no longer
+    * records this run's token matches no rows. Every fenced write extends the
+    * expiry to the runtime clock's now plus `leaseDuration`, so a run that keeps
+    * making progress is never taken over; `Workflow.heartbeat` covers long
+    * Step bodies. The token changes on every ownership change —
     * each acquire (including takeover of an expired lease), and each revocation
     * by reset or termination — and
     * is drawn from a sequence, so it never repeats across an instance's
@@ -2606,10 +2599,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val res: Option[A] = runTransaction {
       for {
         fenceOk <- sql"""
-          SELECT 1 FROM workflow_instances
+          UPDATE workflow_instances SET lease_expires_at = ${leaseExpiry(clock.instant(), leaseDuration)}
           WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
             AND fencing_token = ${lease.fencingToken}
-          FOR NO KEY UPDATE
+          RETURNING 1
         """.query[Int].option
         
         r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]

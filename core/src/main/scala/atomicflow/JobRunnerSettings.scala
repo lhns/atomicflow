@@ -25,8 +25,6 @@ import scala.concurrent.duration.*
   *   max events the best-effort watermark dispatcher processes per pass
   * @param fullSubscriptionScanInterval
   *   cadence of the full subscription scan that guarantees no lost wakeups
-  * @param leaseDuration
-  *   execution lease lifetime; must exceed the longest gap between heartbeats
   * @param leaseAcquireTimeout
   *   bound an external run waits for a leased instance
   * @param cancelTimeout
@@ -44,7 +42,6 @@ final case class JobRunnerSettings(
     sweepInterval: FiniteDuration = 1.second,
     eventDispatchBatchSize: Int = 1000,
     fullSubscriptionScanInterval: FiniteDuration = 1.minute,
-    leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
     cancelTimeout: FiniteDuration = 5.minutes,
     throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
@@ -56,8 +53,8 @@ object JobRunnerSettings {
   def default: JobRunnerSettings = JobRunnerSettings()
 
   /** Test-friendly defaults: one worker for deterministic ordering, tiny
-    * intervals for prompt background progress, short lease/cancel timeouts so
-    * recovery and escalation tests run quickly.
+    * intervals for prompt background progress, short acquire/cancel timeouts so
+    * escalation tests run quickly. The lease duration is the runtime's.
     */
   def forTests: JobRunnerSettings =
     JobRunnerSettings(
@@ -66,7 +63,6 @@ object JobRunnerSettings {
       timerSweepInterval = 25.millis,
       sweepInterval = 50.millis,
       fullSubscriptionScanInterval = 25.millis,
-      leaseDuration = 5.seconds,
       leaseAcquireTimeout = 1.second,
       cancelTimeout = 500.millis
     )

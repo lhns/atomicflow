@@ -361,7 +361,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.runRecoverySweep(), 1)
       assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
       assert(
-        rt.runTransaction(rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty, 5.minutes)).isDefined,
+        rt.runTransaction(rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty)).isDefined,
         "a new owner takes over the expired lease"
       )
 
@@ -462,6 +462,29 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.lastClaimedBatch, Vector.empty, "nothing wakes the instance again")
       assert(!wakeupExists(wf.id, "k"))
     } finally runner.stop(1.second)
+  }
+
+  test("a run that keeps writing steps past leaseDuration keeps its lease") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock, leaseDuration = 10.seconds)
+    val takeover = new java.util.concurrent.atomic.AtomicReference[Option[Long]](None)
+    val woken = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val wf = Workflow[String, String](id = "lease-progress") { in =>
+      Step.atLeastOnce[String]("a") { clock.advanceBy(6.seconds); "a" }
+      Step.atLeastOnce[String]("b") { clock.advanceBy(6.seconds); "b" }
+      Step.atLeastOnce[String]("c") {
+        // 12s after acquisition: past the original 10s lease, but every step
+        // write renewed it.
+        takeover.set(rt.runTransaction(rt.tryAcquireLeaseQ("lease-progress", "k", ScopePath.empty)))
+        woken.set(rt.recoverLease(WorkflowInstanceId("lease-progress", "k")))
+        "c"
+      }
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    assertEquals(takeover.get(), None, "the lease must still be live, so no one can take it over")
+    assertEquals(woken.get(), false, "recovery must not treat the progressing run as crashed")
   }
 
   test("cadence wiring: an unattended suspended-on-timer instance completes autonomously") {

@@ -831,7 +831,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWorkflow("crash-stale-release", runs)
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     val token = rt.runTransaction(
-      rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty, 5.minutes)
+      rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty)
     ).getOrElse(fail("the test instance must acquire a lease"))
     run(
       sql"""
@@ -857,7 +857,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWorkflow("crash-double-release", runs)
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     val token = rt.runTransaction(
-      rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty, 5.minutes)
+      rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty)
     ).getOrElse(fail("the test instance must acquire a lease"))
     assert(leaseExpiresAt(wf.id, "k").isDefined, "the acquired lease is recorded")
 

@@ -207,10 +207,10 @@ raises `LeaseLostException` and aborts the run with **no durable effect**. This 
 the mechanism that makes crash recovery self-healing rather than
 mutual-exclusion-based.
 
-**Lease renewal** is manual — `Workflow.heartbeat()` inside long-running steps,
-also a fenced write (without bumping the token). There is no background
-heartbeater, so `leaseDuration` must exceed the longest gap between heartbeats;
-a lease expiring mid-step invites takeover and at-least-once re-execution of that
+**Lease renewal** rides on the fence: every fenced write renews the lease
+(without bumping the token), and `Workflow.heartbeat()` covers long-running step
+bodies. There is no background heartbeater, so `leaseDuration` must exceed the
+longest gap between writes or heartbeats; a lease expiring mid-step invites takeover and at-least-once re-execution of that
 step (fenced writes still prevent corruption).
 
 **Targeted row locks** are used only for short critical sections:
@@ -251,7 +251,7 @@ evaluation is self-sufficient.
 | Lost wakeup | prevented by the full subscription scan + atomic registration/resolution |
 | Exactly-once timer firing | row lock + `NO event exists` re-check + partial unique index |
 | Cross-tree event ordering | global advisory lock + `CACHE 1` sequence |
-| Failure mode | a step whose body spans `leaseDuration` without heartbeat can be re-executed (at-least-once) |
+| Failure mode | a step whose body spans `leaseDuration` without a write or heartbeat can be re-executed (at-least-once) |
 | Cost | the global event-append lock is a throughput bottleneck |
 
 ### 5.2 Temporal — no distributed locks; server-owned state on a shard
