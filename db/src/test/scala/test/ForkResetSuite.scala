@@ -404,7 +404,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "gate", t2)
     run(
       sql"""
-        UPDATE workflow_steps SET state_kind = 'RetryPending', state_payload = '1:0:-1', retry_deadline = $t3
+        UPDATE workflow_steps SET state_kind = 'RetryPending', state_payload = '1:0:-1'
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'flaky'
       """.update.run
     )

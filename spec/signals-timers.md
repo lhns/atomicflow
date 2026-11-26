@@ -442,7 +442,7 @@ workflow_events (
 )
 workflow_steps (
   workflowInstanceId, stepId, stepVersion, stepKind, stateKind, statePayload,
-  retryDeadline, inputFingerprints, expiresAt, createdAt, updatedAt
+  inputFingerprints, expiresAt, createdAt, updatedAt
 )
 signal_cursor (
   workflowInstanceId, signalKey, sequenceId

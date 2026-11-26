@@ -211,8 +211,8 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     // carries two version rows like after a version bump.
     run(
       sql"""
-        INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
-        SELECT ${wf.id}, 'k', '{}', step_id, step_scope_within_instance, 2, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at
+        INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+        SELECT ${wf.id}, 'k', '{}', step_id, step_scope_within_instance, 2, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at
         FROM workflow_steps
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'b' AND step_version = 1
       """.update.run

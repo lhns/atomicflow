@@ -75,9 +75,10 @@ adds detail to, the documents in `spec/`.
   completed records.
 - A durable step retry is represented on the step record itself: the row's
   `state_kind` is `RetryPending` and carries the retry bookkeeping in
-  `state_payload` plus the deadline in `retry_deadline`. Core compares that
-  deadline against its clock to decide due-ness; the retry's timer subscription
-  is kept only so the timer sweep wakes the instance at the deadline.
+  `state_payload`; its deadline is stored once, in the site's `__retry__` timer
+  subscription, and joined back when the row is read. Core compares that
+  deadline against its clock to decide due-ness; the timer sweep wakes the
+  instance at the deadline.
 - `RetryPolicy.exponentialBackoff` is one method with both retry-count and
   cumulative-delay limits. Scala does not allow both proposed overloads to
   define default arguments.

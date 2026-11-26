@@ -272,7 +272,7 @@ Steps, runtime-computed awaits, `Step.firstCompletedWithoutSuspension`, and
 ```text
 workflow_steps (
   workflowInstanceId, stepId, stepVersion, stepKind, stateKind, statePayload,
-  retryDeadline, inputFingerprints, expiresAt, createdAt, updatedAt
+  inputFingerprints, expiresAt, createdAt, updatedAt
 )
 ```
 
@@ -301,10 +301,14 @@ workflow_steps (
 - `RestartableRegion` state rows carry the region's committed `restartCount`
   and its encoded user state; the runtime replaces them in place on each
   generation boundary.
-- `retryDeadline` is non-null only for `RetryPending`: the clock instant at which
-  the step body may run again. Core compares it against its clock to decide
-  due-ness; the retry's timer subscription is kept only to wake the instance at
-  that deadline.
+- A `RetryPending` row's deadline — the clock instant at which the step body
+  may run again — is stored once, as the deadline of the site's `__retry__`
+  timer subscription, written atomically with the row. Reading the row joins it
+  back; core compares it against its clock to decide due-ness, and the timer
+  sweep wakes the instance once it is due. A `RetryPending` row whose
+  subscription is gone (terminal cleanup) reads as due. Fork does not copy
+  `RetryPending` rows (subscriptions do not travel), so the fork re-executes
+  them from scratch.
 - `statePayload` is a runtime-owned encoded value, so it
   can carry a returned value, failure, retry bookkeeping, or a region's
   `(restartCount, currentState)` without kind-specific nullable columns.

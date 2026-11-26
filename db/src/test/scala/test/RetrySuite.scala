@@ -22,8 +22,12 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(String, String, Option[Instant], Option[Instant])] =
     run(
       sql"""
-        SELECT state_kind, state_payload, retry_deadline, expires_at FROM workflow_steps
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion
+        SELECT s.state_kind, s.state_payload, r.deadline, s.expires_at FROM workflow_steps s
+        LEFT JOIN workflow_subscriptions r
+          ON r.workflow_id = s.workflow_id AND r.workflow_instance_key = s.workflow_instance_key AND r.workflow_instance_scope = s.workflow_instance_scope
+         AND r.step_id = s.step_id AND r.step_scope_within_instance = s.step_scope_within_instance AND r.step_version = s.step_version
+         AND r.kind = 'timer' AND r.subscriber_key = '__retry__'
+        WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.workflow_instance_scope = '{}' AND s.step_id = $stepId AND s.step_version = $stepVersion
       """.query[
           (String, String, Option[Instant], Option[Instant])
         ].option

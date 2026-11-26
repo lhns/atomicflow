@@ -160,8 +160,9 @@ object StepState {
       case _: Region         => StepKind.RestartableRegion
     }
 
-    /** The stored `(state_kind, state_payload, retry_deadline)` columns of the
-      * row this state belongs to.
+    /** The stored `(state_kind, state_payload)` columns of the row this state
+      * belongs to, plus a pending retry's deadline, which a backend stores with
+      * the site's retry timer subscription rather than in the row.
       */
     def persistedColumns: (String, String, Option[Instant]) = state match {
       case SimpleStep.Started =>

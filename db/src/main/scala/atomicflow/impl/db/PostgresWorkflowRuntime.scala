@@ -416,19 +416,18 @@ class PostgresWorkflowRuntime private[atomicflow] (
           )
         else ().pure[ConnectionIO]
         // Copied rows keep their persisted state. Invalidated rows are omitted
-        // so they re-execute in the fork. Rows carrying a retry deadline are
-        // also excluded: they are suspended on their site's retry timer, and
-        // timer subscriptions do not travel with the copy, so the destination
-        // would otherwise suspend on a deadline nothing would ever wake it for.
-        // The destination simply re-executes such steps from scratch.
+        // so they re-execute in the fork. Rows with a pending retry are also
+        // excluded: their deadline lives in the site's retry timer
+        // subscription, and subscriptions do not travel with the copy. The
+        // destination simply re-executes such steps from scratch.
         _ <- sql"""
-          INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
+          INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
           SELECT $newWorkflowId, $newInstanceKey, '{}', step_id, step_scope_within_instance, step_version, step_kind,
-            state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at
+            state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at
           FROM workflow_steps
           WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
             AND NOT ${oneOfStepIds(invalidated.map(row => (row.stepId, row.version)))}
-            AND retry_deadline IS NULL
+            AND state_kind <> 'RetryPending'
         """.update.run
         _ <- upsertWakeupQ(newId.workflowId, newInstanceKey, ScopePath.empty, clock.instant())
       } yield ()
@@ -2206,13 +2205,24 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Option[StoredStep] =
     runTransaction {
       val versionFilter = stepVersion match {
-        case Some(version) => fr"AND step_version = $version"
-        case None          => fr"ORDER BY step_version DESC LIMIT 1"
+        case Some(version) => fr"AND s.step_version = $version"
+        case None          => fr"ORDER BY s.step_version DESC LIMIT 1"
       }
+      // A pending retry's deadline is stored once, in the site's `__retry__`
+      // timer subscription (written with the row by `writeStep`). If that
+      // subscription is gone (terminal cleanup), the retry reads as due.
       (sql"""
-        SELECT step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          AND step_id = $stepId AND step_scope_within_instance = $stepScopePath
+        SELECT s.step_kind, s.state_kind, s.state_payload,
+               CASE WHEN s.state_kind = 'RetryPending' THEN COALESCE(r.deadline, 'epoch'::timestamptz) END,
+               s.input_fingerprints, s.expires_at
+        FROM workflow_steps s
+        LEFT JOIN workflow_subscriptions r
+          ON r.workflow_id = s.workflow_id AND r.workflow_instance_key = s.workflow_instance_key
+         AND r.workflow_instance_scope = s.workflow_instance_scope AND r.step_id = s.step_id
+         AND r.step_scope_within_instance = s.step_scope_within_instance AND r.step_version = s.step_version
+         AND r.kind = 'timer' AND r.subscriber_key = $RetrySubscriberKey
+        WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.workflow_instance_scope = $scope
+          AND s.step_id = $stepId AND s.step_scope_within_instance = $stepScopePath
       """ ++ versionFilter)
         .query[(String, String, String, Option[java.time.Instant], String, Option[java.time.Instant])]
         .option
@@ -2570,7 +2580,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val now = clock.instant()
     val fingerprintText = row.inputFingerprints.raw
     val rowKind = row.state.rowKindText
-    val (stateKind, payloadText, retryDeadline) = row.state.persistedColumns
+    // A retry deadline is not a step column: `writeStep` stores it in the
+    // site's retry timer subscription.
+    val (stateKind, payloadText, _) = row.state.persistedColumns
     val stepRowFilter =
       fr"workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}" ++
         fr" AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion"
@@ -2584,14 +2596,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
       _ <- existingKind match {
         case None =>
           sql"""
-            INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
-            VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $rowKind, $stateKind, $payloadText, $retryDeadline, $fingerprintText, ${row.expiresAt}, $now, $now)
+            INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+            VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $rowKind, $stateKind, $payloadText, $fingerprintText, ${row.expiresAt}, $now, $now)
           """.update.run
 
         case Some(`rowKind`) =>
           (sql"""
             UPDATE workflow_steps
-            SET state_kind = $stateKind, state_payload = $payloadText, retry_deadline = $retryDeadline, input_fingerprints = $fingerprintText, expires_at = ${row.expiresAt}, updated_at = $now
+            SET state_kind = $stateKind, state_payload = $payloadText, input_fingerprints = $fingerprintText, expires_at = ${row.expiresAt}, updated_at = $now
             WHERE
           """ ++ stepRowFilter).update.run
 
