@@ -221,9 +221,10 @@ final class PostgresJobRunner private[atomicflow] (
   )
 
   /** Fires a deadline-ordered batch of due timers across all workflow definitions.
-    * Each fires in its own transaction via
-    * [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]], which rechecks for an
-    * existing event under lock and retains the subscription. Returns the fired count.
+    * The selection is a plain read; each timer fires in its own transaction via
+    * [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]], which locks only the
+    * owning instance row, rechecks for an existing event and retains the
+    * subscription. Returns the fired count.
     */
   private[atomicflow] def runTimerSweep(): Int = {
     val now = runtime.clock.instant()
@@ -242,7 +243,6 @@ final class PostgresJobRunner private[atomicflow] (
           )
         ORDER BY s.deadline
         LIMIT ${settings.timerBatchSize}
-        FOR UPDATE OF s SKIP LOCKED
       """
         .query[TimerSweepRow].to[Vector]
     }
@@ -281,17 +281,17 @@ final class PostgresJobRunner private[atomicflow] (
     escalated
   }
 
-  /** Recovers up to 128 expired leases by clearing expiry and advancing the
-    * fencing token. Non-terminal instances also receive a replay wakeup.
-    * Rechecks expiry transactionally to preserve renewed or replaced leases.
-    * Idempotent; returns the recovered count.
+  /** Wakes up to 128 non-terminal instances whose lease expired, so a crashed
+    * run is replayed. Wake-only: the next acquisition takes the expired lease
+    * over and advances the fencing token. Rechecks expiry per instance so a
+    * renewed lease is left alone. Idempotent; returns the woken count.
     */
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
       sql"""
             SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
-            WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= $now
+            WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
             LIMIT 128
       """
         .query[InstanceRow].to[Vector]
@@ -301,7 +301,7 @@ final class PostgresJobRunner private[atomicflow] (
       if (runtime.recoverLease(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
         recovered += 1
     }
-    if (recovered > 0) logger.info(s"Lease recovery sweep recovered $recovered expired leases")
+    if (recovered > 0) logger.info(s"Lease recovery sweep woke $recovered instances with expired leases")
     recovered
   }
 

@@ -23,11 +23,11 @@ Every pending timer await owns one row in `workflow_timer_subscriptions` (site, 
 2. **It is the scheduling source.** The timer sweep's only input is this row's stored deadline; without the row, due timers of unattended instances would never produce a wakeup and no runner would ever come.
 3. **It identifies the firing event.** Each registration gets a timer id reused on replay. Invalidation creates a new subscription and timer id, so an old `TimerFired` event cannot satisfy the replacement wait. The partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` prevents concurrent firing from storing duplicate events.
 
-**The scheduler must not delete the subscription when it fires.** Firing appends the `TimerFired` event; deleting the row would (a) make the existing event unmatchable, because evaluation correlates events to the site via the row's timer id, and (b) destroy the stored deadline, forcing the replay recomputation of point 1. Both break the resume that the fired event was supposed to enable. The row survives firing and is retired **only when its await resolves** — atomically with the step row and cursor moves — or by terminal cleanup. Until then, the "no existing event" re-check under the subscription row lock keeps repeated sweeps idempotent no-ops. Deletion is therefore exclusively the await's retirement decision, never the scheduler's.
+**The scheduler must not delete the subscription when it fires.** Firing appends the `TimerFired` event; deleting the row would (a) make the existing event unmatchable, because evaluation correlates events to the site via the row's timer id, and (b) destroy the stored deadline, forcing the replay recomputation of point 1. Both break the resume that the fired event was supposed to enable. The row survives firing and is retired **only when its await resolves** — atomically with the step row and cursor moves — or by terminal cleanup. Until then, the "no existing event" re-check under the instance row lock keeps repeated sweeps idempotent no-ops. Deletion is therefore exclusively the await's retirement decision, never the scheduler's.
 
 ### Timer firing: two paths, one primitive
 
-A due timer becomes a durable fact — a `TimerFired` event keyed by its timer id — through two paths that share one primitive: **lock the subscription row, re-check that no event exists yet, append `TimerFired` (global append mutex), commit.** The subscription row survives firing; it is retired only when its await resolves.
+A due timer becomes a durable fact — a `TimerFired` event keyed by its timer id — through two paths that share one primitive: **lock the owning instance row, re-check that the subscription exists and no event exists yet, append `TimerFired` (global append mutex, the last lock taken), commit.** The subscription row survives firing; it is retired only when its await resolves.
 
 **Path 1 — the scheduler (sweep).** Runs as a driver-loop step of the JobRunner (see `running-workflows.md`, "Job runner and scheduling") every `timerSweepInterval`:
 
@@ -38,11 +38,10 @@ every timerSweepInterval:
            AND NOT EXISTS (matching TimerFired event)       -- idempotent across passes
            AND instance non-terminal
          ORDER BY s.deadline LIMIT :timerBatch
-         FOR UPDATE OF s SKIP LOCKED                        -- the claim (row lock, no delete)
   for each row, in its own transaction:
     BEGIN
-      lock the owning instance row (FOR NO KEY UPDATE)      -- instance row first
-      lock the subscription row; re-check "no event exists"
+      lock the owning instance row (FOR NO KEY UPDATE)      -- the only row lock
+      re-check "subscription exists, no event exists"
       upsert wakeup of the owning instance
       pg_advisory_xact_lock(:eventSequenceLock)             -- append lock last
       append TimerFired (nextval + INSERT)
@@ -53,7 +52,7 @@ every timerSweepInterval:
 
 - **Why the sweep pre-fires: race predictability.** Eager firing puts the timer's occurrence at ≈ deadline + sweep latency, so a signal arriving after the deadline (but before the next sweep pass) still *loses* the race. Evaluation-only firing would stretch the occurrence window to "whenever the instance next runs", making race outcomes depend on runner timing.
 - **Why evaluation also fires: self-sufficiency.** Manual mode has no sweep; the run materializes its own due timers, so `advanceBy` + `run` decides race outcomes deterministically (see `running-workflows.md`, "Testing"). A deadline that passed while the runner was down is likewise unstuck by the next `run`.
-- **Exactly once.** The subscription row lock plus the re-check arbitrates concurrent firing by sweep and evaluation; the partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` is the safety net.
+- **Exactly once.** The instance row lock (evaluation holds it through its lease fence) plus the re-check arbitrates concurrent firing by sweep and evaluation; the partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` is the safety net.
 - Firing is **late, never early** — a timer means "wait at least until its deadline". Firing lag (`now - deadline` at append time) is a monitored metric.
 - Bounded, deadline-ordered batches keep timer catch-up (after downtime or mass registration) from starving signal and completion events.
 - Step retries with delays above the durable-suspension threshold are ordinary timer subscriptions and ride this mechanism; below the threshold they are inline sleeps inside the run (see `steps.md`).

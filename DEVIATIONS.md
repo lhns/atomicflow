@@ -155,9 +155,10 @@ adds detail to, the documents in `spec/`.
   unbounded; `attempts` is the durable alerting trace. An unreachable database
   needs no additional pacing: the claim transaction itself fails and the driver
   loop's cycle backoff applies.
-- Lease recovery re-checks the expiry inside its own transaction, so a lease
-  renewed by a heartbeat or taken over after the sweep's selection is never
-  cleared; terminal instances lose only a stale lease, never their outcome.
+- Lease recovery only upserts the wakeup of a non-terminal instance whose
+  lease expired; the next acquisition takes the lease over and advances the
+  fencing token. The expiry is re-checked in the insert, so a lease renewed
+  after the sweep's selection is left alone.
 - A technical failure inside a `Workflow.parallel` branch is a collected branch
   outcome, joined like every other: no branch is interrupted by an
   infrastructure abort, so no sibling Step can persist an
@@ -172,8 +173,8 @@ adds detail to, the documents in `spec/`.
   the periodic full subscription scan also finds subscriptions that committed
   concurrently with those events. Both passes retry database deadlocks.
 - Cancellation, lease recovery, and child-close sweeps use batches of 128.
-  Lease recovery also clears a stale lease on a terminal instance (without
-  scheduling it) so a failed post-completion release cannot linger.
+  A stale lease on a terminal instance is left as is: claim and acquisition
+  exclude terminal instances, so it has no effect.
 - Cancellation is never finalized in place; it is delivered before the next
   uncached step or wait, for every instance state including one that has never
   run. A body that reaches a terminal state without passing a checkpoint

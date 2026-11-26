@@ -411,7 +411,6 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       )
       runner.runRecoverySweep()
       assert(wakeupExists(wf.id, "k"), "the recovery sweep must re-schedule a lease whose restore was lost")
-      assertEquals(leaseExpiresAt(wf.id, "k"), None)
       runner.runDriverCycle()
       assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
     } finally runner.stop(1.second)

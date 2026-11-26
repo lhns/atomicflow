@@ -215,7 +215,7 @@ object Workflow {
 - Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
 - **Release.** A run releases the lease when it ends (suspension, terminal state, abort) by clearing `lease_expires_at`, guarded by its token. Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
-- **Expiry is the crash signal**: `lease_expires_at IS NOT NULL AND lease_expires_at <= now()` means the worker died or stalled — or a post-completion release failed; the recovery sweep revokes the lease (clears the expiry and advances the fencing token, fencing out the crashed run) and re-enqueues non-terminal instances (terminal instances keep their outcome and only lose the stale lease). The expiry is re-checked in the recovery transaction itself, so a lease renewed or taken over between selection and recovery is never revoked.
+- **Expiry is the crash signal**: `lease_expires_at IS NOT NULL AND lease_expires_at <= now()` means the worker died or stalled — or a post-completion release failed; the recovery sweep only re-enqueues the non-terminal instance (upserts its wakeup); the next acquisition takes the expired lease over and advances the fencing token, fencing out the crashed run. The sweep locks no instance row. The expiry is re-checked when the wakeup is inserted, so a lease renewed between selection and recovery is left alone.
 - External `run` on a leased instance waits for the lease up to `leaseAcquireTimeout` (bounded poll of the conditional update) and then throws a runtime-owned lease-unavailable exception. It never steals a live lease.
 
 ### Claiming wakeups and the run loop
@@ -261,14 +261,14 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 
 | Sweep | Predicate | Action |
 |---|---|---|
-| Timer firing | due, not-yet-fired timer subscriptions | fire + upsert wakeup (mechanics: `signals-timers.md`, "Timer firing: two paths, one primitive") |
+| Timer firing | due, not-yet-fired timer subscriptions | per instance, under its row lock only: fire + upsert wakeup (mechanics: `signals-timers.md`, "Timer firing: two paths, one primitive") |
 | Cancellation escalation | `cancel_requested_at IS NOT NULL AND terminal_state IS NULL AND cancel_requested_at <= now() - cancelTimeout` | guarded `terminate` transition: `TERMINATED` outcome, lease revoked (fencing-token advance), wakeups deleted |
-| Lease recovery | `lease_expires_at IS NOT NULL AND lease_expires_at <= now()` | revoke the lease: clear `lease_expires_at` and advance `fencing_token` (fencing the crashed run out); upsert wakeup for non-terminal instances (a terminal instance's stale lease is only revoked). The expiry is re-checked inside the recovery transaction, so a lease renewed or taken over after selection is left alone |
+| Lease recovery | `lease_expires_at IS NOT NULL AND lease_expires_at <= now() AND terminal_state IS NULL` | wake-only: upsert the wakeup; the claim's acquisition takes the expired lease over and advances `fencing_token` (fencing the crashed run out). The expiry is re-checked in the insert, so a lease renewed after selection is left alone. A terminal instance's stale lease is harmless (acquisition and claim exclude terminal instances) and is left as is |
 
 - The timer sweep processes due timers in deadline order within bounded batches (`timerBatchSize`), so timer catch-up (after downtime or mass registration) cannot starve signal and completion events.
 - **Timers progress without the sweep.** A manual run — no runner, no sweep — fires the await's own due timers during evaluation, so timer waits resolve correctly in manual mode too; the sweep exists only so *unattended* instances are noticed promptly. Mechanics in `signals-timers.md` ("Run semantics" above; "Timer firing: two paths, one primitive" there).
 - The escalation sweep implements `cancelTimeout` ("Cancellation and termination") and is the only path that turns a stuck `CANCELLING` instance into `TERMINATED`.
-- Lease recovery bounds worker crashes: the crashed run is fenced out by the fencing-token advance, and the instance is replayed from its Step cache.
+- Lease recovery bounds worker crashes: the re-enqueued instance is replayed from its Step cache, and the takeover's fencing-token advance fences the crashed run out. Recovery derives the wakeup from durable state (the expired lease), so a lost wakeup is regenerated.
 - The same sweep mechanism is the designated hook for future retention (auto-deletion of terminal instances).
 
 ### Children, created instances, and continue-as-new

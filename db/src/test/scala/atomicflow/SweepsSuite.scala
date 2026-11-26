@@ -296,7 +296,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("recovery sweep revokes an expired lease, advances the fencing token, and upserts a wakeup") {
+  test("recovery sweep wakes an instance with an expired lease; the claim takes it over and advances the token") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val sig = Signal[String]("approve")
@@ -320,11 +320,12 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       )
 
       assertEquals(runner.runRecoverySweep(), 1)
-
-      val row = leaseRow(wf.id, "k").get
-      assertEquals(row._1, None, "the expired lease must be revoked (expiry cleared)")
-      assert(row._2 > before, "recovery must advance the fencing token to fence the crashed run")
       assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
+      assertEquals(leaseRow(wf.id, "k").get._2, before, "recovery itself is wake-only")
+
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch, Vector(id), "the claim takes over the expired lease")
+      assert(leaseRow(wf.id, "k").get._2 > before, "the takeover advances the fencing token to fence the crashed run")
     } finally runner.stop(1.second)
   }
 
@@ -354,13 +355,18 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       thread.start()
       waitUntil(bodyStarted.getCount == 0)
 
-      // The run's lease expires while the body is paused; recovery revokes it.
+      // The run's lease expires while the body is paused; recovery wakes the
+      // instance and a new owner takes the expired lease over.
       clock.advanceBy(1.hour)
       assertEquals(runner.runRecoverySweep(), 1)
       assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
+      assert(
+        rt.runTransaction(rt.tryAcquireLeaseQ(wf.id, "k", ScopePath.empty, 5.minutes)).isDefined,
+        "a new owner takes over the expired lease"
+      )
 
       // The stale run resumes: its next fenced write (the heartbeat) must be
-      // fenced out by the recovery's token advance.
+      // fenced out by the takeover's token advance.
       releaseBody.countDown()
       waitUntil(done.getCount == 0)
       assert(captured.get().exists(_.isInstanceOf[LeaseLostException]),
@@ -390,7 +396,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("recovery sweep ignores live leases, clears stale terminal leases, and re-enqueues non-terminal ones") {
+  test("recovery sweep ignores live leases and terminal instances") {
     val rt = newRuntime
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "recover-live") { in =>
@@ -423,10 +429,38 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
           WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 't' AND workflow_instance_scope = '{}'
         """.update.run
       )
-      assertEquals(runner.runRecoverySweep(), 1)
-      val terminalRow = leaseRow(wf2.id, "t").get
-      assertEquals(terminalRow._1, None, "a terminal instance's stale lease is revoked (a failed post-completion release must not linger)")
-      assert(!wakeupExists(wf2.id, "t"), "but the terminal instance is never re-scheduled")
+      assertEquals(runner.runRecoverySweep(), 0, "a terminal instance's stale lease is harmless and left alone")
+      assert(!wakeupExists(wf2.id, "t"), "the terminal instance is never re-scheduled")
+    } finally runner.stop(1.second)
+  }
+
+  test("a due timer whose site is not reached on the next run is fired once and does not wake the instance again") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val sig = Signal[String]("go")
+    val awaitTimer = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val wf = Workflow[String, String](id = "orphan-timer") { in =>
+      if (awaitTimer.get()) Step.await[Unit]("t", Awaitable.Timer(1.minute))
+      else Step.await[String]("w", Awaitable.SignalEvent(sig))
+      "done"
+    }
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      val id = rt.createWorkflowInstance(wf, "k", "in").id
+      assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+      // The next run takes another path: the timer site is never evaluated again.
+      awaitTimer.set(false)
+      clock.advanceBy(2.minutes)
+
+      assertEquals(runner.runTimerSweep(), 1)
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch, Vector(id))
+      assert(!wakeupExists(wf.id, "k"), "the run consumed the wakeup and suspended on the signal")
+
+      assertEquals(runner.runTimerSweep(), 0, "the orphaned timer already fired; it is not selected again")
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch, Vector.empty, "nothing wakes the instance again")
+      assert(!wakeupExists(wf.id, "k"))
     } finally runner.stop(1.second)
   }
 

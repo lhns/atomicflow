@@ -38,8 +38,8 @@ object PostgresWorkflowRuntime {
   *
   * Lease acquisition and revocation advance a sequence-backed `fencing_token`.
   * Only its current owner may write; tokens never repeat, even after instance
-  * recreation. Recovery clears expired leases and advances the token to fence
-  * out stale runs.
+  * recreation. Taking over an expired lease advances the token and fences out
+  * the stale run; the recovery sweep only wakes such instances.
   */
 class PostgresWorkflowRuntime private[atomicflow] (
     dataSource: DataSource,
@@ -1422,12 +1422,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   /** The timer-firing primitive shared by the scheduler sweep (Path 1) and await
-    * evaluation (Path 2): lock the owning instance row (the lock order every
-    * instance transaction follows), then the subscription row, re-check that
-    * no `TimerFired` event exists yet, upsert the instance's wakeup and append
-    * the event last (the append lock is always the last lock taken). Returns
-    * whether it fired; a subscription that was concurrently retired or already
-    * fired is a no-op. The subscription row survives firing.
+    * evaluation (Path 2): lock the owning instance row — the only row lock;
+    * await evaluation fires under the same lock (its lease fence), so the two
+    * paths are serialized without locking the subscription — re-check that the
+    * subscription still exists and has no `TimerFired` event yet, upsert the
+    * instance's wakeup and append the event last (the append lock is always the
+    * last lock taken). Returns whether it fired; a subscription that was
+    * concurrently retired or already fired is a no-op. The subscription row
+    * survives firing.
     */
   private[atomicflow] def fireTimerSubscriptionQ(
       timerId: java.util.UUID,
@@ -1445,7 +1447,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
       locked <- sql"""
         SELECT deadline FROM workflow_timer_subscriptions
         WHERE timer_id = $timerId
-        FOR UPDATE
       """.query[java.time.Instant].option
 
       fired <- locked match {
@@ -1487,42 +1488,30 @@ class PostgresWorkflowRuntime private[atomicflow] (
     fired
   }
 
-  /** Lease recovery of an instance whose lease expired while still owned: in one
-    * guarded transaction, clear `lease_expires_at` and advance `fencing_token`,
-    * fencing out the crashed run (whose token-guarded writes now match no
-    * rows), and upsert the instance's wakeup. Returns whether it revoked
-    * anything; a live lease is a no-op. A terminal instance's *expired* lease is
-    * still revoked (a failed post-completion release must not linger), but it
-    * gets no wakeup. Idempotent.
+  /** Lease recovery of an instance whose lease expired while still owned: only
+    * upserts the instance's wakeup. The next acquisition (a runner claim or an
+    * external run) takes over the expired lease and advances the fencing
+    * token, which fences out the crashed run; until then nothing else may
+    * write. Returns whether the lease was expired. Terminal instances and live
+    * leases are untouched. Idempotent.
     */
   private[atomicflow] def recoverLease(instanceId: WorkflowInstanceId): Boolean = {
-    val workflowId = instanceId.workflowId
-    val key = instanceId.workflowInstanceKey
-    val scope = instanceId.scope
     val now = clock.instant()
     runTransaction {
-      for {
-        // The expiry is re-checked HERE, not only by the sweep's selection
-        // query: between the two, the lease may have been renewed by a
-        // heartbeat or acquired by another worker (with a new fencing token),
-        // and recovery must never revoke a live lease. Terminal instances are
-        // included so a lease whose post-completion release failed (e.g. a
-        // technical error in the release transaction) does not linger; they
-        // only get the lease revoked, never a wakeup.
-        terminal <- sql"""
-          UPDATE workflow_instances
-          SET lease_expires_at = NULL, fencing_token = nextval('workflow_fencing_token_seq')
-          WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-            AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now
-          RETURNING terminal_state
-        """.query[Option[String]].option
-
-        _ <- terminal match {
-              case Some(None) => upsertWakeupQ(workflowId, key, scope, now)
-              case _          => ().pure[ConnectionIO]
-            }
-      } yield terminal.isDefined
-    }
+      sql"""
+        WITH expired AS (
+          SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
+          WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
+            AND workflow_instance_scope = ${instanceId.scope}
+            AND terminal_state IS NULL AND lease_expires_at IS NOT NULL AND lease_expires_at <= $now
+        ), woken AS (
+          INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, attempts)
+          SELECT workflow_id, workflow_instance_key, workflow_instance_scope, $now, 0 FROM expired
+          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
+        )
+        SELECT count(*)::int FROM expired
+      """.query[Int].unique
+    } > 0
   }
 
   /** Best-effort watermark dispatch. Processes events appended after the stored
@@ -1904,7 +1893,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Clears the lease expiry if this run still holds the fencing token and a
     * lease is still recorded. "Owned" means the row still records this run's
     * token and `lease_expires_at` is still set: if the lease was revoked by
-    * recovery or taken over by another acquire (both advance the token), or
+    * termination or taken over by another acquire (both advance the token), or
     * already released, this updates no row and cannot clobber the new owner's
     * lease. Optimization only — correctness relies on expiry plus fencing, not
     * on this release. The external (`run`) path calls it in a `finally`; the job
@@ -1939,8 +1928,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * still executing, no wakeup is created (and any leftover row is removed); if
     * the instance row is gone, there is nothing to restore. If this transaction
     * itself fails — the database may still be down — the caller must leave the
-    * lease in place: the lease-expiry recovery sweep then clears it and upserts
-    * the wakeup, so the instance is never left with neither a wakeup nor an
+    * lease in place: the lease-expiry recovery sweep then upserts the wakeup
+    * and the next claim takes the expired lease over, so the instance is never left with neither a wakeup nor an
     * owned lease.
     */
   private[atomicflow] def restoreWakeupAndReleaseLease(
@@ -2610,7 +2599,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * COMMITTED Postgres re-checks the `WHERE` clause against the latest row
     * version after acquiring the lock, so a row that no longer records this
     * run's token matches no rows. The token changes on every ownership change —
-    * each acquire, and each revocation by lease recovery or termination — and
+    * each acquire (including takeover of an expired lease), and each revocation
+    * by termination — and
     * is drawn from a sequence, so it never repeats across an instance's
     * deletion and recreation; a fenced-out run always matches no rows.
     */
@@ -2711,7 +2701,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
           AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion
           AND deadline <= $now
         ORDER BY deadline, timer_id
-        FOR UPDATE
       """.query[java.util.UUID].to[Vector]
       fired <- due.traverse { subId =>
         for {

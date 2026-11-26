@@ -786,7 +786,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(6.minutes)
     val clean = cleanRuntime(clock)
     assertEquals(clean.recoverLease(id), true)
-    assertEquals(leaseExpiresAt(wf.id, "k"), None, "recovery clears the expired lease")
     assertEquals(wakeupCount(wf.id, "k"), 1, "recovery re-schedules the interrupted instance")
 
     assertEquals(clean.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"))
@@ -814,7 +813,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(6.minutes)
     val clean = cleanRuntime(clock)
     assertEquals(clean.recoverLease(id), true)
-    assertEquals(leaseExpiresAt(wf.id, "k"), None)
     assertEquals(wakeupCount(wf.id, "k"), 1, "recovery re-enqueues the claimed instance")
 
     val cleanRunner = clean.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
@@ -896,7 +894,6 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(6.minutes)
     val clean = cleanRuntime(clock)
     assertEquals(clean.recoverLease(id), true)
-    assertEquals(leaseExpiresAt(wf.id, "k"), None)
     assertEquals(wakeupCount(wf.id, "k"), 1)
 
     sig.send(id, "hello")(using clean)
@@ -940,8 +937,7 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
 
     clock.advanceBy(6.minutes)
     val clean = cleanRuntime(clock)
-    assertEquals(clean.recoverLease(id), true)
-    assertEquals(leaseExpiresAt(wf.id, "k"), None)
+    assertEquals(clean.recoverLease(id), false, "a terminal instance is not re-enqueued; its stale lease is harmless")
 
     assertEquals(clean.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-in"))
     assertEquals(runs.get(), 1)
