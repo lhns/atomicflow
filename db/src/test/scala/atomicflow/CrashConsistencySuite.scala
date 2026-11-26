@@ -66,6 +66,23 @@ class CrashConsistencySuite extends PostgresWorkflowRuntimeSuite {
   private def cleanRuntime(clock: Clock = Clock.systemUTC()): PostgresWorkflowRuntime =
     runtimeWith(FaultInjector.Noop, clock)
 
+  /** After each fault scenario and one pass of every background pass, no
+    * instance may be left that nothing will ever run again.
+    */
+  override def afterEach(context: AfterEach): Unit = {
+    val rt = cleanRuntime()
+    val runner = rt.startJobRunnerForTests(Seq.empty, JobRunnerSettings.forTests)
+    try {
+      runner.runTimerSweep()
+      runner.runRecoverySweep()
+      rt.dispatchNewEvents(1000)
+      rt.scanAllSubscriptions()
+    } finally runner.stop(1.second)
+    val stuck = stuckInstances()
+    super.afterEach(context)
+    assertEquals(stuck, Vector.empty, "instances left that nothing will run again")
+  }
+
   private def stepState(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
